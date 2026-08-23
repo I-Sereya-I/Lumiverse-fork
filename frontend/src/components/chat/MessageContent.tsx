@@ -1162,12 +1162,39 @@ function notifyMessageContentLayout(el: HTMLElement): void {
 
 function IsolatedHtml({ html, isStreaming }: { html: string; isStreaming: boolean }) {
   const ref = useRef<HTMLDivElement>(null)
+  const lastHtmlRef = useRef<string | null>(null)
 
   useLayoutEffect(() => {
     const el = ref.current
     if (!el) return
     const shadow = el.shadowRoot ?? el.attachShadow({ mode: 'open' })
+
+    // Preserve IMG element identity by src across innerHTML replacements so
+    // images don't redo the cache lookup, decode, paint cycle when an island
+    // updates in place.
+    const stableImgs = new Map<string, HTMLImageElement>()
+    if (lastHtmlRef.current !== null) {
+      for (const img of shadow.querySelectorAll<HTMLImageElement>('img[src]')) {
+        const src = img.getAttribute('src')
+        if (src && !stableImgs.has(src)) stableImgs.set(src, img)
+      }
+    }
+
     shadow.innerHTML = `<style data-lumi-island-base>${ISLAND_BASE_CSS}</style>${html}`
+    lastHtmlRef.current = html
+
+    if (stableImgs.size > 0) {
+      for (const newImg of shadow.querySelectorAll<HTMLImageElement>('img[src]')) {
+        const src = newImg.getAttribute('src')
+        if (!src) continue
+        const preserved = stableImgs.get(src)
+        if (preserved && newImg.parentNode) {
+          newImg.replaceWith(preserved)
+          stableImgs.delete(src)
+        }
+      }
+    }
+
     for (const actionEl of shadow.querySelectorAll<HTMLElement>('[data-lumiverse-regex-action]')) {
       actionEl.style.cursor = 'pointer'
     }
@@ -1520,7 +1547,7 @@ export default function MessageContent({
       : undefined),
     [messageId, isUser],
   )
-  const regexAppliedContent = useDisplayRegex(interceptorCleanedContent, isUser, depth, macroCtx, preprocessOpts)
+  const regexAppliedContent = useDisplayRegex(interceptorCleanedContent, isUser, depth, macroCtx, preprocessOpts, isStreaming)
 
   const risuResolvedContent = useMemo(
     () => {

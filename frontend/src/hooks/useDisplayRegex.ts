@@ -717,6 +717,7 @@ export function useDisplayRegex(
   depth: number,
   macroCtx?: DisplayMacroContext,
   preprocessOpts?: DisplayPreprocessOpts,
+  isStreaming = false,
 ): string {
   const regexScripts = useStore((s) => s.regexScripts)
   const activeCharacterId = useStore((s) => s.activeCharacterId)
@@ -1143,17 +1144,31 @@ export function useDisplayRegex(
 
   // Carry the previous resolved value forward across cv-bumps and per-chunk
   // content churn so the sync fallback's raw {{...}} doesn't flash through
-  // during the async re-resolve window.
-  const lastResolvedRef = useRef<{ content: string; value: string } | null>(null)
+  // during the async re-resolve window. While a message is streaming, the
+  // carry also spans pending re-resolves whose input no longer matches
+  // exactly (extension-owned chats return fully macro-resolved output, so
+  // RAW_MACRO never matches there); this keeps mounted HTML islands stable
+  // until the replacement string is ready. The ref is keyed by messageId and
+  // cleared on stream start so edits/regenerations never inherit stale panels.
+  const lastResolvedRef = useRef<{ messageId: string | null; content: string; value: string } | null>(null)
+  const wasStreamingRef = useRef(isStreaming)
+  if (wasStreamingRef.current !== isStreaming) {
+    wasStreamingRef.current = isStreaming
+    if (isStreaming) lastResolvedRef.current = null
+  }
   const liveResolved = cachedResolvedContent
     ?? (resolvedContentState?.key === contentCacheKey ? resolvedContentState.value : undefined)
+  const resolvedMessageId = preprocessOpts?.messageId ?? null
   if (liveResolved !== undefined) {
-    lastResolvedRef.current = { content, value: liveResolved }
+    lastResolvedRef.current = { messageId: resolvedMessageId, content, value: liveResolved }
   }
   const stale = lastResolvedRef.current
-  const staleResolved = stale && (stale.content === content || RAW_MACRO_RE.test(fallbackContent))
+  const staleMatchesMessage = !!stale && stale.messageId === resolvedMessageId
+  const staleResolved = staleMatchesMessage && (stale.content === content || RAW_MACRO_RE.test(fallbackContent))
     ? stale.value
-    : undefined
+    : staleMatchesMessage && isStreaming && liveResolved === undefined && contentCacheKey !== null
+      ? stale.value
+      : undefined
 
   // No stale to carry forward (first render of a streaming bubble), so raw input renders cleaner than panel HTML with unresolved macros.
   if (liveResolved === undefined && staleResolved === undefined && RAW_MACRO_RE.test(fallbackContent)) {
