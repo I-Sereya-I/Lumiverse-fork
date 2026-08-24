@@ -1,0 +1,143 @@
+import { getDb } from "../db/connection";
+import { eventBus } from "../ws/bus";
+import { EventType } from "../ws/events";
+import { worldBookVectorDesiredStatusSql, } from "./world-book-vector-state";
+import { WORLD_BOOK_VECTOR_SETTINGS_KEY } from "./world-book-vector-constants";
+const MAX_SETTING_KEY_LENGTH = 200;
+const MAX_SETTING_VALUE_BYTES = 2 * 1024 * 1024; // 2 MB serialized JSON
+// Theme packs embed their assets as base64 in savedThemes. A fully supported
+// 250 MiB theme archive expands to about 333 MiB when represented as JSON, so
+// this leaves room for the manifest and saved-theme metadata.
+export const MAX_SAVED_THEMES_VALUE_BYTES = 350 * 1024 * 1024;
+const SETTING_KEY_PATTERN = /^[A-Za-z0-9._:-]{1,200}$/;
+export class InvalidSettingError extends Error {
+    status = 400;
+}
+function markWorldBookVectorStatesStaleForSettingsChange(userId) {
+    getDb().query(`UPDATE world_book_entries
+     SET vector_index_status = ${worldBookVectorDesiredStatusSql()},
+         vector_indexed_at = NULL,
+         vector_index_error = NULL
+     WHERE world_book_id IN (SELECT id FROM world_books WHERE user_id = ?)`).run(userId);
+}
+function assertValidKey(key) {
+    if (typeof key !== "string" || key.length === 0 || key.length > MAX_SETTING_KEY_LENGTH) {
+        throw new InvalidSettingError(`Setting key must be a non-empty string ≤${MAX_SETTING_KEY_LENGTH} chars`);
+    }
+    if (!SETTING_KEY_PATTERN.test(key)) {
+        throw new InvalidSettingError("Setting key may only contain letters, digits, '.', '_', '-', and ':'");
+    }
+}
+function serializeValueOrThrow(key, value) {
+    // Settings storage is opaque JSON; reject payloads that would otherwise
+    // bloat the DB or block the event loop on every read.
+    let json;
+    try {
+        json = JSON.stringify(value ?? null);
+    }
+    catch (err) {
+        throw new InvalidSettingError(`Setting "${key}" value is not JSON-serializable: ${err?.message || "unknown"}`);
+    }
+    const maxBytes = key === "savedThemes"
+        ? MAX_SAVED_THEMES_VALUE_BYTES
+        : MAX_SETTING_VALUE_BYTES;
+    if (json.length > maxBytes) {
+        throw new InvalidSettingError(`Setting "${key}" exceeds ${maxBytes} bytes serialized`);
+    }
+    return json;
+}
+export function getAllSettings(userId) {
+    const rows = getDb().query("SELECT key, value, updated_at FROM settings WHERE user_id = ?").all(userId);
+    return rows.map((r) => ({ ...r, value: JSON.parse(r.value) }));
+}
+export function getSetting(userId, key) {
+    const row = getDb().query("SELECT key, value, updated_at FROM settings WHERE key = ? AND user_id = ?").get(key, userId);
+    if (!row)
+        return null;
+    return { ...row, value: JSON.parse(row.value) };
+}
+export function getSettingsByKeys(userId, keys) {
+    if (keys.length === 0)
+        return new Map();
+    const placeholders = keys.map(() => "?").join(", ");
+    const rows = getDb()
+        .query(`SELECT key, value FROM settings WHERE user_id = ? AND key IN (${placeholders})`)
+        .all(userId, ...keys);
+    const result = new Map();
+    for (const row of rows) {
+        result.set(row.key, JSON.parse(row.value));
+    }
+    return result;
+}
+export function putSetting(userId, key, value, options = {}) {
+    assertValidKey(key);
+    const json = serializeValueOrThrow(key, value);
+    const now = Math.floor(Date.now() / 1000);
+    const existingRow = key === WORLD_BOOK_VECTOR_SETTINGS_KEY
+        ? getDb().query("SELECT value FROM settings WHERE key = ? AND user_id = ?").get(key, userId)
+        : null;
+    getDb()
+        .query(`INSERT INTO settings (key, value, user_id, updated_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(key, user_id) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
+        .run(key, json, userId, now);
+    if (key === WORLD_BOOK_VECTOR_SETTINGS_KEY && existingRow?.value !== json) {
+        markWorldBookVectorStatesStaleForSettingsChange(userId);
+    }
+    const setting = { key, value, updated_at: now };
+    if (!options.suppressBroadcast) {
+        eventBus.emit(EventType.SETTINGS_UPDATED, { key, value }, userId);
+    }
+    if (!options.suppressBroadcast && key === "activeChatId") {
+        eventBus.emit(EventType.CHAT_SWITCHED, { chatId: typeof value === "string" ? value : null }, userId);
+    }
+    return setting;
+}
+const MAX_SETTINGS_PER_BULK_PUT = 200;
+export function putMany(userId, settings) {
+    if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+        throw new InvalidSettingError("settings payload must be an object");
+    }
+    const entries = Object.entries(settings);
+    if (entries.length > MAX_SETTINGS_PER_BULK_PUT) {
+        throw new InvalidSettingError(`Cannot upsert more than ${MAX_SETTINGS_PER_BULK_PUT} settings in one request`);
+    }
+    // Validate everything before opening the transaction so an invalid entry
+    // doesn't leave us in a partially-applied state.
+    const prepared = [];
+    for (const [key, value] of entries) {
+        assertValidKey(key);
+        prepared.push({ key, value, json: serializeValueOrThrow(key, value) });
+    }
+    const db = getDb();
+    const now = Math.floor(Date.now() / 1000);
+    const results = [];
+    const existingValues = prepared.some((entry) => entry.key === WORLD_BOOK_VECTOR_SETTINGS_KEY)
+        ? new Map(db
+            .query(`SELECT key, value FROM settings WHERE user_id = ? AND key IN (${prepared.map(() => "?").join(", ")})`)
+            .all(userId, ...prepared.map((entry) => entry.key))
+            .map((row) => [row.key, row.value]))
+        : null;
+    const upsert = db.query(`INSERT INTO settings (key, value, user_id, updated_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(key, user_id) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`);
+    const transaction = db.transaction(() => {
+        for (const { key, value, json } of prepared) {
+            upsert.run(key, json, userId, now);
+            results.push({ key, value, updated_at: now });
+        }
+    });
+    transaction();
+    const worldBookVectorSettingsChanged = prepared.some((entry) => entry.key === WORLD_BOOK_VECTOR_SETTINGS_KEY && existingValues?.get(entry.key) !== entry.json);
+    if (worldBookVectorSettingsChanged) {
+        markWorldBookVectorStatesStaleForSettingsChange(userId);
+    }
+    eventBus.emit(EventType.SETTINGS_UPDATED, { keys: prepared.map((p) => p.key) }, userId);
+    const activeChatEntry = prepared.find((p) => p.key === "activeChatId");
+    if (activeChatEntry) {
+        eventBus.emit(EventType.CHAT_SWITCHED, { chatId: typeof activeChatEntry.value === "string" ? activeChatEntry.value : null }, userId);
+    }
+    return results;
+}
+export function deleteSetting(userId, key) {
+    const result = getDb().query("DELETE FROM settings WHERE key = ? AND user_id = ?").run(key, userId);
+    return result.changes > 0;
+}

@@ -142,6 +142,10 @@
   cursor: pointer;
 }
 
+.editActions[data-edit-and-send-side='right'] .editSaveBtn { order: 3; }
+.editActions[data-edit-and-send-side='left'] [data-edit-and-send-action='true'] { order: 1; }
+.editActions[data-edit-and-send-side='right'] [data-edit-and-send-action='true'] { order: 3; }
+
 /* ── Mobile ── */
 @media (max-width: 600px) {
   .reasoningTextarea {

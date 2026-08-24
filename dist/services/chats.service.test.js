@@ -1,0 +1,699 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { closeDatabase, getDb, initDatabase } from "../db/connection";
+import { eventBus } from "../ws/bus";
+import { EventType } from "../ws/events";
+import { addGroupMember, addSwipe, applyChatAppearance, branchChat, convertSoloChatToGroup, createChat, deleteChats, getChat, getChatTree, cycleSwipe, getMessage, getMessages, getPreviousSameRoleContent, getTrailingVisibleUserMessageIds, listHiddenRecentChats, listGroupChatSummaries, listRecentChats, listRecentChatsGrouped, patchMessageExtra, removeGroupMember, searchMessages, setGroupMemberAlternateFields, updateMessage, } from "./chats.service";
+function initChatsTestDb() {
+    closeDatabase();
+    initDatabase(":memory:");
+    const db = getDb();
+    db.run(`CREATE TABLE characters (
+    id TEXT PRIMARY KEY,
+    user_id TEXT,
+    name TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    personality TEXT NOT NULL DEFAULT '',
+    scenario TEXT NOT NULL DEFAULT '',
+    first_mes TEXT NOT NULL DEFAULT '',
+    mes_example TEXT NOT NULL DEFAULT '',
+    creator TEXT NOT NULL DEFAULT '',
+    creator_notes TEXT NOT NULL DEFAULT '',
+    system_prompt TEXT NOT NULL DEFAULT '',
+    post_history_instructions TEXT NOT NULL DEFAULT '',
+    avatar_path TEXT,
+    image_id TEXT,
+    tags TEXT NOT NULL DEFAULT '[]',
+    alternate_greetings TEXT NOT NULL DEFAULT '[]',
+    extensions TEXT NOT NULL DEFAULT '{}',
+    created_at INTEGER NOT NULL DEFAULT 1,
+    updated_at INTEGER NOT NULL DEFAULT 1
+  )`);
+    db.run(`CREATE TABLE chats (
+    id TEXT PRIMARY KEY,
+    user_id TEXT,
+    character_id TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    metadata TEXT NOT NULL DEFAULT '{}',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  )`);
+    db.run(`CREATE TABLE messages (
+    id TEXT PRIMARY KEY,
+    chat_id TEXT NOT NULL,
+    index_in_chat INTEGER NOT NULL,
+    is_user INTEGER NOT NULL DEFAULT 0,
+    name TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL DEFAULT '',
+    send_date INTEGER NOT NULL,
+    swipe_id INTEGER NOT NULL DEFAULT 0,
+    swipes TEXT NOT NULL DEFAULT '[]',
+    swipe_dates TEXT NOT NULL DEFAULT '[]',
+    extra TEXT NOT NULL DEFAULT '{}',
+    parent_message_id TEXT,
+    branch_id TEXT,
+    created_at INTEGER NOT NULL
+  )`);
+    db.run(`CREATE TABLE chat_memory_cache (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    settings_key TEXT NOT NULL,
+    source_message_count INTEGER NOT NULL DEFAULT 0,
+    query_preview TEXT NOT NULL DEFAULT '',
+    chunks_json TEXT NOT NULL DEFAULT '[]',
+    formatted TEXT NOT NULL DEFAULT '',
+    count INTEGER NOT NULL DEFAULT 0,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    settings_source TEXT NOT NULL DEFAULT 'global',
+    chunks_available INTEGER NOT NULL DEFAULT 0,
+    chunks_pending INTEGER NOT NULL DEFAULT 0,
+    retrieval_mode TEXT NOT NULL DEFAULT 'empty',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(chat_id, settings_key)
+  )`);
+}
+function seedCharacter(id, name) {
+    getDb().query("INSERT INTO characters (id, user_id, name) VALUES (?, ?, ?)").run(id, "u1", name);
+}
+function seedCharacterWithExtensions(id, extensions = {}) {
+    getDb()
+        .query("INSERT INTO characters (id, user_id, name, extensions) VALUES (?, ?, ?, ?)")
+        .run(id, "u1", id, JSON.stringify(extensions));
+}
+function seedChat(id, characterId, name, metadata, updatedAt) {
+    getDb()
+        .query("INSERT INTO chats (id, user_id, character_id, name, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        .run(id, "u1", characterId, name, metadata, updatedAt, updatedAt);
+}
+function seedMessage(id, chatId, content, extra, options) {
+    const index = options?.index ?? 0;
+    const isUser = options?.isUser ?? false;
+    const name = options?.name ?? (isUser ? "User" : "Assistant");
+    const sendDate = options?.sendDate ?? 100;
+    getDb()
+        .query(`INSERT INTO messages (
+        id, chat_id, index_in_chat, is_user, name, content, send_date, swipe_id,
+        swipes, swipe_dates, extra, parent_message_id, branch_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(id, chatId, index, isUser ? 1 : 0, name, content, sendDate, 0, JSON.stringify([content]), JSON.stringify([sendDate]), JSON.stringify(extra), null, null, sendDate);
+}
+beforeEach(() => {
+    initChatsTestDb();
+    seedCharacter("c1", "Alpha");
+    seedCharacter("c2", "Beta");
+});
+afterEach(() => {
+    closeDatabase();
+});
+describe("previous same-role content", () => {
+    test("finds the nearest earlier message with the same role", () => {
+        seedCharacter("char", "Character");
+        seedChat("chat", "char", "Chat", "{}", 1);
+        seedMessage("greeting", "chat", "hello", {}, { index: 0 });
+        seedMessage("user-1", "chat", "first user", {}, { index: 1, isUser: true });
+        seedMessage("assistant-1", "chat", "first assistant", {}, { index: 2 });
+        seedMessage("user-2", "chat", "second user", {}, { index: 3, isUser: true });
+        seedMessage("assistant-2", "chat", "second assistant", {}, { index: 4 });
+        expect(getPreviousSameRoleContent("u1", "chat", true, "user-2"))
+            .toBe("first user");
+        expect(getPreviousSameRoleContent("u1", "chat", false, "assistant-2"))
+            .toBe("first assistant");
+    });
+    test("falls back to the greeting when no same-role message exists", () => {
+        seedCharacter("char", "Character");
+        seedChat("chat", "char", "Chat", "{}", 1);
+        seedMessage("greeting", "chat", "hello", {}, { index: 0 });
+        seedMessage("user-1", "chat", "first user", {}, { index: 1, isUser: true });
+        expect(getPreviousSameRoleContent("u1", "chat", true, "user-1"))
+            .toBe("hello");
+    });
+});
+describe("trailing visible user messages", () => {
+    test("skips hidden turns and stops at the latest visible assistant", () => {
+        seedChat("chat", "c1", "Chat", "{}", 1);
+        seedMessage("assistant", "chat", "reply", {}, { index: 0 });
+        seedMessage("user-1", "chat", "one", {}, { index: 1, isUser: true });
+        seedMessage("hidden-assistant", "chat", "draft", { hidden: true }, { index: 2 });
+        seedMessage("user-2", "chat", "two", {}, { index: 3, isUser: true });
+        seedMessage("hidden-user", "chat", "draft", { hidden: true }, { index: 4, isUser: true });
+        expect(getTrailingVisibleUserMessageIds("u1", "chat"))
+            .toEqual(["user-1", "user-2"]);
+        expect(getTrailingVisibleUserMessageIds("other-user", "chat")).toEqual([]);
+    });
+    test("paginates through long runs of hidden messages", () => {
+        seedChat("chat", "c1", "Chat", "{}", 1);
+        seedMessage("assistant", "chat", "reply", {}, { index: 0 });
+        seedMessage("user", "chat", "queued", {}, { index: 1, isUser: true });
+        for (let index = 2; index < 140; index++) {
+            seedMessage(`hidden-${index}`, "chat", "draft", { hidden: true }, { index });
+        }
+        expect(getTrailingVisibleUserMessageIds("u1", "chat")).toEqual(["user"]);
+    });
+});
+describe("chat greeting selection", () => {
+    test("persists the selected greeting index on the chat and greeting message", () => {
+        getDb()
+            .query("UPDATE characters SET first_mes = ?, alternate_greetings = ? WHERE id = ?")
+            .run("Default greeting", JSON.stringify(["Alternate one", "Alternate two"]), "c1");
+        const chat = createChat("u1", {
+            character_id: "c1",
+            greeting_index: 2,
+        });
+        const greeting = getMessages("u1", chat.id)[0];
+        expect(chat.metadata.activeGreetingIndex).toBe(2);
+        expect(greeting?.content).toBe("Alternate two");
+        expect(greeting?.extra.greeting_index).toBe(2);
+    });
+});
+describe("chat lifecycle events", () => {
+    test("emits CHAT_CREATED after solo creation and group conversion", async () => {
+        const events = [];
+        const unsubscribe = eventBus.on(EventType.CHAT_CREATED, (event) => events.push(event));
+        try {
+            const solo = createChat("u1", { character_id: "c1", name: "Solo" });
+            const converted = convertSoloChatToGroup("u1", solo.id);
+            expect(converted).not.toBeNull();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            expect(events.map((event) => event.payload.id)).toEqual([solo.id, converted.id]);
+            expect(events.every((event) => event.userId === "u1")).toBe(true);
+            expect(events[1]?.payload.chat.metadata).toEqual(expect.objectContaining({
+                group: true,
+                character_ids: ["c1"],
+            }));
+        }
+        finally {
+            unsubscribe();
+        }
+    });
+});
+describe("chat message search", () => {
+    test("searches the active swipe and omits internal injected messages", () => {
+        seedChat("chat-find", "c1", "Find", "{}", 100);
+        seedMessage("before", "chat-find", "No match here", {}, { index: 0 });
+        seedMessage("active-swipe", "chat-find", "Stale content", {}, { index: 1 });
+        getDb().query("UPDATE messages SET swipes = ?, swipe_id = ? WHERE id = ?").run(JSON.stringify(["needle in an inactive swipe", "Needle in the active swipe"]), 1, "active-swipe");
+        seedMessage("injected", "chat-find", "Needle in internal content", { _loom_inject: { block_id: "hidden" } }, { index: 2 });
+        seedMessage("after", "chat-find", "A second needle result", {}, { index: 3 });
+        const result = searchMessages("u1", "chat-find", "needle");
+        expect(result.total).toBe(2);
+        expect(result.message_total).toBe(4);
+        expect(result.truncated).toBe(false);
+        expect(result.data).toEqual([
+            { id: "active-swipe", index_in_chat: 1, offset: 1 },
+            { id: "after", index_in_chat: 3, offset: 3 },
+        ]);
+        expect(searchMessages("u1", "chat-find", "inactive").total).toBe(0);
+    });
+});
+describe("recent chats", () => {
+    test("loads recent chats with malformed metadata", () => {
+        seedChat("bad", "c1", "Bad metadata", "not json", 200);
+        seedChat("good", "c2", "Good metadata", "{}", 100);
+        const result = listRecentChats("u1", { limit: 10, offset: 0 });
+        expect(result.total).toBe(2);
+        expect(result.data.map((chat) => chat.id)).toEqual(["bad", "good"]);
+        expect(result.data[0].metadata).toEqual({});
+    });
+    test("flat recent list searches, sorts, and stays one row per chat", () => {
+        seedChat("z-newest", "c1", "Zeta newest", "{}", 300);
+        seedChat("a-middle", "c1", "Alpha middle", "{}", 200);
+        seedChat("debugger", "c2", "Branch #1", "{}", 100);
+        const byRecent = listRecentChats("u1", { limit: 10, offset: 0 });
+        expect(byRecent.data.map((chat) => chat.id)).toEqual(["z-newest", "a-middle", "debugger"]);
+        const byName = listRecentChats("u1", { limit: 10, offset: 0 }, { sort: "name", direction: "asc" });
+        expect(byName.data.map((chat) => chat.id)).toEqual(["a-middle", "debugger", "z-newest"]);
+        const byCreatedDesc = listRecentChats("u1", { limit: 10, offset: 0 }, { sort: "created", direction: "desc" });
+        expect(byCreatedDesc.data.map((chat) => chat.id)).toEqual(["z-newest", "a-middle", "debugger"]);
+        const search = listRecentChats("u1", { limit: 10, offset: 0 }, { search: "branch" });
+        expect(search.data.map((chat) => chat.id)).toEqual(["debugger"]);
+        // Search matches character names too, not just chat names.
+        const byCharacter = listRecentChats("u1", { limit: 10, offset: 0 }, { search: "beta" });
+        expect(byCharacter.total).toBe(1);
+    });
+    test("flat recent list hides hidden_from_recent chats", () => {
+        seedChat("shown", "c1", "Shown", "{}", 100);
+        seedChat("hidden", "c1", "Hidden", JSON.stringify({ hidden_from_recent: true }), 200);
+        const result = listRecentChats("u1", { limit: 10, offset: 0 });
+        expect(result.data.map((chat) => chat.id)).toEqual(["shown"]);
+    });
+    test("flat recent list enriches rows with message count and preview", () => {
+        seedChat("enriched", "c1", "Enriched", "{}", 100);
+        seedMessage("m1", "enriched", "first message", {}, { index: 0 });
+        seedMessage("m2", "enriched", "last message body", {}, { index: 1 });
+        seedChat("empty", "c2", "Empty", "{}", 50);
+        const result = listRecentChats("u1", { limit: 10, offset: 0 });
+        const enriched = result.data.find((chat) => chat.id === "enriched");
+        expect(enriched?.message_count).toBe(2);
+        expect(enriched?.last_message_preview).toBe("last message body");
+        const empty = result.data.find((chat) => chat.id === "empty");
+        expect(empty?.message_count).toBe(0);
+        expect(empty?.last_message_preview).toBe("");
+    });
+    test("groups recent chats without SQLite JSON extraction", () => {
+        seedChat("c1-old", "c1", "Alpha old", "{}", 100);
+        seedChat("group", "c1", "Group", JSON.stringify({ group: true, character_ids: ["c1", "c2"] }), 150);
+        seedChat("c1-new", "c1", "Alpha new", "{}", 200);
+        seedChat("bad", "c2", "Bad metadata", "not json", 250);
+        const result = listRecentChatsGrouped("u1", { limit: 10, offset: 0 });
+        expect(result.total).toBe(3);
+        expect(result.data.map((chat) => chat.latest_chat_id)).toEqual(["bad", "c1-new", "group"]);
+        expect(result.data[1].chat_count).toBe(2);
+        expect(result.data[2].is_group).toBe(true);
+        expect(result.data[2].group_character_ids).toEqual(["c1", "c2"]);
+    });
+    test("groups recent group chat forks by member set", () => {
+        seedChat("group-root", "c1", "Group", JSON.stringify({ group: true, character_ids: ["c1", "c2"] }), 100);
+        seedChat("group-branch", "c1", "Group — Branch at #2", JSON.stringify({
+            group: true,
+            character_ids: ["c2", "c1"],
+            branched_from: "group-root",
+            branch_at_message: "msg-2",
+        }), 200);
+        seedChat("other-group", "c1", "Other Group", JSON.stringify({ group: true, character_ids: ["c1"] }), 150);
+        const result = listRecentChatsGrouped("u1", { limit: 10, offset: 0 });
+        expect(result.total).toBe(2);
+        expect(result.data.map((chat) => chat.latest_chat_id)).toEqual(["group-branch", "other-group"]);
+        expect(result.data[0].chat_count).toBe(2);
+        expect(result.data[0].is_group).toBe(true);
+        expect(result.data[0].group_character_ids).toEqual(["c2", "c1"]);
+    });
+    test("clusters group chat forks even when membership has diverged from the root", () => {
+        // Parent gained a member after the branch was taken (or the branch dropped
+        // one) — the branch should still cluster with the root rather than spawn a
+        // second landing-page entry.
+        seedChat("group-root", "c1", "Group", JSON.stringify({ group: true, character_ids: ["c1", "c2", "c3"] }), 100);
+        seedChat("group-branch", "c1", "Group — Branch at #2", JSON.stringify({
+            group: true,
+            character_ids: ["c1", "c2"],
+            branched_from: "group-root",
+            branch_at_message: "msg-2",
+        }), 200);
+        const result = listRecentChatsGrouped("u1", { limit: 10, offset: 0 });
+        expect(result.total).toBe(1);
+        expect(result.data[0].latest_chat_id).toBe("group-branch");
+        expect(result.data[0].chat_count).toBe(2);
+        expect(result.data[0].is_group).toBe(true);
+        // group_character_ids reflects the surviving (latest) row's own members.
+        expect(result.data[0].group_character_ids).toEqual(["c1", "c2"]);
+    });
+    test("dedupes group chats whose character_ids contain duplicate entries", () => {
+        seedChat("group-clean", "c1", "Group", JSON.stringify({ group: true, character_ids: ["c1", "c2"] }), 100);
+        seedChat("group-dup", "c1", "Group dup", JSON.stringify({ group: true, character_ids: ["c1", "c1", "c2"] }), 200);
+        const result = listRecentChatsGrouped("u1", { limit: 10, offset: 0 });
+        expect(result.total).toBe(1);
+        expect(result.data[0].latest_chat_id).toBe("group-dup");
+        expect(result.data[0].chat_count).toBe(2);
+    });
+    test("hides chats marked hidden_from_recent and surfaces the next recent chat", () => {
+        seedChat("c1-old", "c1", "Alpha old", "{}", 100);
+        seedChat("c1-new", "c1", "Alpha new", JSON.stringify({ hidden_from_recent: true }), 200);
+        seedChat("c2-only", "c2", "Beta only", "{}", 150);
+        const result = listRecentChatsGrouped("u1", { limit: 10, offset: 0 });
+        expect(result.total).toBe(2);
+        expect(result.data.map((chat) => chat.latest_chat_id)).toEqual(["c2-only", "c1-old"]);
+        expect(result.data[1].chat_count).toBe(1);
+    });
+    test("lists explicitly hidden chats for the landing-page restore manager", () => {
+        seedChat("visible", "c1", "Visible chat", "{}", 100);
+        seedChat("hidden-solo", "c1", "Hidden chat", JSON.stringify({ hidden_from_recent: true }), 200);
+        seedChat("hidden-group", "c2", "Hidden group", JSON.stringify({
+            hidden_from_recent: true,
+            group: true,
+            character_ids: ["c1", "c2"],
+        }), 300);
+        expect(listHiddenRecentChats("u1")).toEqual([
+            expect.objectContaining({ id: "hidden-group", name: "Hidden group", character_name: "Beta", is_group: true }),
+            expect.objectContaining({ id: "hidden-solo", name: "Hidden chat", character_name: "Alpha", is_group: false }),
+        ]);
+    });
+    test("pins favorite solo characters before pagination without moving groups", () => {
+        seedChat("favorite-old", "c1", "Favorite", "{}", 100);
+        seedChat("recent", "c2", "Recent", "{}", 300);
+        seedChat("group", "c2", "Group", JSON.stringify({ group: true, character_ids: ["c1", "c2"] }), 200);
+        const result = listRecentChatsGrouped("u1", { limit: 2, offset: 0 }, { favoriteCharacterIds: ["c1"] });
+        expect(result.total).toBe(3);
+        expect(result.data.map((chat) => chat.latest_chat_id)).toEqual(["favorite-old", "recent"]);
+    });
+    test("hides solo character cards before grouping and pagination but keeps groups", () => {
+        seedChat("c1-old", "c1", "Alpha old", "{}", 100);
+        seedChat("c1-new", "c1", "Alpha new", "{}", 300);
+        seedChat("c2-only", "c2", "Beta only", "{}", 200);
+        seedChat("group", "c1", "Group", JSON.stringify({ group: true, character_ids: ["c1", "c2"] }), 250);
+        const result = listRecentChatsGrouped("u1", { limit: 10, offset: 0 }, { hiddenCharacterIds: ["c1"] });
+        expect(result.total).toBe(2);
+        expect(result.data.map((chat) => chat.latest_chat_id)).toEqual(["group", "c2-only"]);
+        expect(result.data[0].is_group).toBe(true);
+    });
+    test("keeps reasoning scoped to the swipe it belongs to", () => {
+        seedChat("chat-1", "c1", "Swipe chat", "{}", 100);
+        seedMessage("msg-1", "chat-1", "first swipe", {
+            reasoning: "first swipe reasoning",
+            reasoningDuration: 123,
+        });
+        const added = addSwipe("u1", "msg-1", "");
+        expect(added.swipe_id).toBe(1);
+        expect(added.extra.reasoning).toBeUndefined();
+        expect(added.extra.reasoningDuration).toBeUndefined();
+        patchMessageExtra("u1", "msg-1", {
+            ...added.extra,
+            reasoning: "second swipe reasoning",
+            reasoningDuration: 456,
+        });
+        const secondSwipe = getMessage("u1", "msg-1");
+        expect(secondSwipe.swipe_id).toBe(1);
+        expect(secondSwipe.extra.reasoning).toBe("second swipe reasoning");
+        expect(secondSwipe.extra.reasoningDuration).toBe(456);
+        const firstSwipe = cycleSwipe("u1", "msg-1", "left");
+        expect(firstSwipe.swipe_id).toBe(0);
+        expect(firstSwipe.extra.reasoning).toBe("first swipe reasoning");
+        expect(firstSwipe.extra.reasoningDuration).toBe(123);
+        const restoredSecondSwipe = cycleSwipe("u1", "msg-1", "right");
+        expect(restoredSecondSwipe.swipe_id).toBe(1);
+        expect(restoredSecondSwipe.extra.reasoning).toBe("second swipe reasoning");
+        expect(restoredSecondSwipe.extra.reasoningDuration).toBe(456);
+    });
+    test("clears active swipe reasoning with explicit null without clearing other swipes", () => {
+        seedChat("chat-1", "c1", "Swipe chat", "{}", 100);
+        seedMessage("msg-1", "chat-1", "first swipe", {
+            reasoning: "first swipe reasoning",
+            reasoningDuration: 123,
+        });
+        const added = addSwipe("u1", "msg-1", "second swipe");
+        patchMessageExtra("u1", "msg-1", {
+            ...added.extra,
+            reasoning: "second swipe reasoning",
+            reasoningDuration: 456,
+        });
+        const activeBeforeClear = getMessage("u1", "msg-1");
+        const cleared = updateMessage("u1", "msg-1", {
+            extra: {
+                ...activeBeforeClear.extra,
+                reasoning: null,
+                reasoningDuration: null,
+            },
+        });
+        expect(cleared.swipe_id).toBe(1);
+        expect(cleared.extra.reasoning).toBeUndefined();
+        expect(cleared.extra.reasoningDuration).toBeUndefined();
+        const firstSwipe = cycleSwipe("u1", "msg-1", "left");
+        expect(firstSwipe.swipe_id).toBe(0);
+        expect(firstSwipe.extra.reasoning).toBe("first swipe reasoning");
+        expect(firstSwipe.extra.reasoningDuration).toBe(123);
+        const restoredSecondSwipe = cycleSwipe("u1", "msg-1", "right");
+        expect(restoredSecondSwipe.swipe_id).toBe(1);
+        expect(restoredSecondSwipe.extra.reasoning).toBeUndefined();
+        expect(restoredSecondSwipe.extra.reasoningDuration).toBeUndefined();
+    });
+    test("keeps native reasoning carriers scoped to the swipe that produced them", () => {
+        seedChat("chat-1", "c1", "Swipe chat", "{}", 100);
+        seedMessage("msg-1", "chat-1", "first swipe", {
+            reasoningCarrier: { type: "reasoning_content", content: "first native" },
+        });
+        const added = addSwipe("u1", "msg-1", "second swipe");
+        patchMessageExtra("u1", "msg-1", {
+            ...added.extra,
+            reasoningCarrier: {
+                type: "reasoning_details",
+                details: [{ type: "reasoning.text", text: "second native" }],
+            },
+        });
+        expect(getMessage("u1", "msg-1").extra.reasoningCarrier).toEqual({
+            type: "reasoning_details",
+            details: [{ type: "reasoning.text", text: "second native" }],
+        });
+        expect(cycleSwipe("u1", "msg-1", "left").extra.reasoningCarrier).toEqual({
+            type: "reasoning_content",
+            content: "first native",
+        });
+    });
+    test("keeps generation metadata scoped to the active swipe", () => {
+        seedChat("chat-1", "c1", "Swipe chat", "{}", 100);
+        seedMessage("msg-1", "chat-1", "first swipe", {
+            tokenCount: 11,
+            generationMetrics: { model: "first-model", tps: 1.1 },
+            usage: { completion_tokens: 11, total_tokens: 22 },
+        });
+        const added = addSwipe("u1", "msg-1", "");
+        expect(added.swipe_id).toBe(1);
+        expect(added.extra.tokenCount).toBeUndefined();
+        expect(added.extra.generationMetrics).toBeUndefined();
+        expect(added.extra.usage).toBeUndefined();
+        patchMessageExtra("u1", "msg-1", {
+            ...added.extra,
+            tokenCount: 33,
+            generationMetrics: { model: "second-model", tps: 3.3 },
+            usage: { completion_tokens: 33, total_tokens: 44 },
+        });
+        const secondSwipe = getMessage("u1", "msg-1");
+        expect(secondSwipe.extra.tokenCount).toBe(33);
+        expect(secondSwipe.extra.generationMetrics).toEqual({ model: "second-model", tps: 3.3 });
+        expect(secondSwipe.extra.usage).toEqual({ completion_tokens: 33, total_tokens: 44 });
+        const firstSwipe = cycleSwipe("u1", "msg-1", "left");
+        expect(firstSwipe.swipe_id).toBe(0);
+        expect(firstSwipe.extra.tokenCount).toBe(11);
+        expect(firstSwipe.extra.generationMetrics).toEqual({ model: "first-model", tps: 1.1 });
+        expect(firstSwipe.extra.usage).toEqual({ completion_tokens: 11, total_tokens: 22 });
+        const restoredSecondSwipe = cycleSwipe("u1", "msg-1", "right");
+        expect(restoredSecondSwipe.swipe_id).toBe(1);
+        expect(restoredSecondSwipe.extra.tokenCount).toBe(33);
+        expect(restoredSecondSwipe.extra.generationMetrics).toEqual({ model: "second-model", tps: 3.3 });
+        expect(restoredSecondSwipe.extra.usage).toEqual({ completion_tokens: 33, total_tokens: 44 });
+    });
+    test("converts a solo chat into a new group chat with copied messages", () => {
+        seedChat("solo", "c1", "Alpha chat", JSON.stringify({ author_note: "keep me" }), 200);
+        seedMessage("msg-1", "solo", "Hello there", { greeting: true }, { index: 0, sendDate: 100 });
+        seedMessage("msg-2", "solo", "Hi back", { persona_id: "p1" }, { index: 1, isUser: true, name: "User", sendDate: 150 });
+        const converted = convertSoloChatToGroup("u1", "solo");
+        const copiedMessages = getMessages("u1", converted.id);
+        const original = getChat("u1", "solo");
+        expect(converted.id).not.toBe("solo");
+        expect(converted.character_id).toBe("c1");
+        expect(converted.name).toBe("Alpha chat");
+        expect(converted.metadata).toEqual({
+            author_note: "keep me",
+            group: true,
+            character_ids: ["c1"],
+        });
+        expect(copiedMessages).toHaveLength(2);
+        expect(copiedMessages.map((message) => ({
+            is_user: message.is_user,
+            name: message.name,
+            content: message.content,
+            send_date: message.send_date,
+            extra: message.extra,
+        }))).toEqual([
+            {
+                is_user: false,
+                name: "Assistant",
+                content: "Hello there",
+                send_date: 100,
+                extra: { greeting: true },
+            },
+            {
+                is_user: true,
+                name: "User",
+                content: "Hi back",
+                send_date: 150,
+                extra: { persona_id: "p1" },
+            },
+        ]);
+        expect(original.metadata).toEqual({ author_note: "keep me" });
+    });
+    test("detaches a converted group chat from a solo fork lineage", () => {
+        seedChat("solo-root", "c1", "Alpha chat", "{}", 100);
+        seedMessage("msg-1", "solo-root", "Hello there", {}, { index: 0 });
+        const fork = branchChat("u1", "solo-root", "msg-1");
+        expect(fork.metadata.branched_from).toBe("solo-root");
+        const converted = convertSoloChatToGroup("u1", fork.id);
+        const group = addGroupMember("u1", converted.id, "c2", { skip_greeting: true });
+        expect(group.metadata.group).toBe(true);
+        expect(group.metadata.character_ids).toEqual(["c1", "c2"]);
+        expect(group.metadata.branched_from).toBeUndefined();
+        expect(group.metadata.branch_at_message).toBeUndefined();
+        expect(getChatTree("u1", group.id)?.id).toBe(group.id);
+    });
+    test("keeps a forked one-member converted group separate from unrelated solo RPs", () => {
+        seedChat("solo-source", "c1", "Converted RP", "{}", 100);
+        seedMessage("source-msg-1", "solo-source", "Opening", {}, { index: 0 });
+        seedMessage("source-msg-2", "solo-source", "Reply", {}, { index: 1, isUser: true });
+        seedChat("unrelated-solo", "c1", "Other RP", "{}", 300);
+        seedChat("unrelated-solo-fork", "c1", "Other RP — Branch", JSON.stringify({
+            branched_from: "unrelated-solo",
+            branch_at_message: "other-msg",
+        }), 400);
+        const converted = convertSoloChatToGroup("u1", "solo-source");
+        const convertedMessages = getMessages("u1", converted.id);
+        const fork = branchChat("u1", converted.id, convertedMessages[1].id);
+        const groupHistory = listGroupChatSummaries("u1", ["c1"]);
+        expect(groupHistory.map((chat) => chat.id).sort()).toEqual([converted.id, fork.id].sort());
+        expect(groupHistory.every((chat) => !chat.name.startsWith("Other RP"))).toBe(true);
+        expect(getChat("u1", converted.id)).not.toBeNull();
+    });
+});
+describe("bulk chat deletion", () => {
+    test("deletes only owned selected chats and ignores duplicate or missing ids", () => {
+        seedChat("delete-one", "c1", "One", "{}", 100);
+        seedChat("delete-two", "c1", "Two", "{}", 200);
+        seedChat("keep", "c1", "Keep", "{}", 300);
+        getDb()
+            .query("INSERT INTO chats (id, user_id, character_id, name, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+            .run("foreign", "u2", "c1", "Foreign", "{}", 400, 400);
+        const deleted = deleteChats("u1", ["delete-two", "missing", "delete-one", "delete-two", "foreign"]);
+        expect(deleted).toEqual(["delete-two", "delete-one"]);
+        expect(getChat("u1", "delete-one")).toBeNull();
+        expect(getChat("u1", "delete-two")).toBeNull();
+        expect(getChat("u1", "keep")?.name).toBe("Keep");
+        const foreign = getDb().query("SELECT id FROM chats WHERE id = ?").get("foreign");
+        expect(foreign?.id).toBe("foreign");
+    });
+});
+describe("group member alternate fields", () => {
+    test("merges selections for one member without clobbering other members", () => {
+        const extensions = {
+            alternate_fields: {
+                personality: [{ id: "bold", label: "Bold", content: "Bold personality" }],
+            },
+        };
+        seedCharacterWithExtensions("char1", extensions);
+        seedCharacterWithExtensions("char2", extensions);
+        seedChat("chat1", "char1", "Group", JSON.stringify({
+            group: true,
+            character_ids: ["char1", "char2"],
+            group_alternate_field_selections: { char2: { personality: "bold" } },
+        }), 1);
+        const updated = setGroupMemberAlternateFields("u1", "chat1", "char1", { personality: "bold" });
+        expect(updated?.metadata.group_alternate_field_selections).toEqual({
+            char1: { personality: "bold" },
+            char2: { personality: "bold" },
+        });
+    });
+    test("rejects invalid variants", () => {
+        seedCharacterWithExtensions("char1", {
+            alternate_fields: {
+                personality: [{ id: "known", label: "Known", content: "Known personality" }],
+            },
+        });
+        seedCharacterWithExtensions("char2");
+        seedChat("chat1", "char1", "Group", JSON.stringify({ group: true, character_ids: ["char1", "char2"] }), 1);
+        const updated = setGroupMemberAlternateFields("u1", "chat1", "char1", { personality: "missing" });
+        expect(updated).toBeNull();
+        expect(getChat("u1", "chat1")?.metadata.group_alternate_field_selections).toBeUndefined();
+    });
+    test("removing a member clears stale alternate field selections", () => {
+        seedCharacterWithExtensions("char1");
+        seedCharacterWithExtensions("char2");
+        seedCharacterWithExtensions("char3");
+        seedChat("chat1", "char1", "Group", JSON.stringify({
+            group: true,
+            character_ids: ["char1", "char2", "char3"],
+            group_alternate_field_selections: {
+                char2: { personality: "bold" },
+                char3: { personality: "quiet" },
+            },
+        }), 1);
+        const updated = removeGroupMember("u1", "chat1", "char2");
+        expect(updated?.metadata.group_alternate_field_selections).toEqual({
+            char3: { personality: "quiet" },
+        });
+    });
+});
+describe("avatar-bound appearance", () => {
+    const appearanceExtensions = {
+        alternate_fields: {
+            description: [{ id: "winter-desc", label: "Winter", content: "Winter coat" }],
+            personality: [{ id: "warm", label: "Warm", content: "Warm personality" }],
+        },
+        alternate_avatars: [{ id: "winter-avatar", image_id: "winter-image", label: "Winter" }],
+        avatar_bindings: {
+            "winter-avatar": {
+                description: "winter-desc",
+                personality: "warm",
+                scenario: null,
+                greeting_index: 1,
+            },
+        },
+    };
+    test("selecting an avatar applies its complete field and greeting state", () => {
+        seedCharacterWithExtensions("char1", appearanceExtensions);
+        getDb().query("UPDATE characters SET image_id = ?, first_mes = ?, alternate_greetings = ? WHERE id = ?")
+            .run("primary-image", "Default hello", JSON.stringify(["Winter hello"]), "char1");
+        const chat = createChat("u1", { character_id: "char1", name: "Chat" });
+        const result = applyChatAppearance("u1", chat.id, { type: "avatar", avatar_entry_id: "winter-avatar" });
+        expect(result?.chat.metadata.active_avatar_id).toBe("winter-image");
+        expect(result?.chat.metadata.active_avatar_entry_id).toBe("winter-avatar");
+        expect(result?.chat.metadata.alternate_field_selections).toEqual({
+            description: "winter-desc",
+            personality: "warm",
+        });
+        expect(result?.chat.metadata.activeGreetingIndex).toBe(1);
+        expect(result?.greeting_message?.content).toBe("Winter hello");
+        expect(result?.greeting_message?.extra.greeting_index).toBe(1);
+    });
+    test("selecting a uniquely bound field activates the owning avatar", () => {
+        seedCharacterWithExtensions("char1", appearanceExtensions);
+        getDb().query("UPDATE characters SET alternate_greetings = ? WHERE id = ?")
+            .run(JSON.stringify(["Winter hello"]), "char1");
+        seedChat("chat1", "char1", "Chat", "{}", 1);
+        const result = applyChatAppearance("u1", "chat1", {
+            type: "field",
+            field: "description",
+            variant_id: "winter-desc",
+        });
+        expect(result?.chat.metadata.active_avatar_id).toBe("winter-image");
+        expect(result?.chat.metadata.alternate_field_selections.personality).toBe("warm");
+    });
+    test("an unbound field change does not rewrite an edited greeting", () => {
+        seedCharacterWithExtensions("char1", {
+            alternate_fields: {
+                description: [{ id: "winter-desc", label: "Winter", content: "Winter coat" }],
+            },
+        });
+        getDb().query("UPDATE characters SET first_mes = ? WHERE id = ?").run("Card greeting", "char1");
+        const chat = createChat("u1", { character_id: "char1", name: "Chat" });
+        const greeting = getMessages("u1", chat.id)[0];
+        updateMessage("u1", greeting.id, { content: "User-edited greeting" });
+        const result = applyChatAppearance("u1", chat.id, {
+            type: "field",
+            field: "description",
+            variant_id: "winter-desc",
+        });
+        expect(result?.greeting_message).toBeUndefined();
+        expect(getMessages("u1", chat.id)[0]?.content).toBe("User-edited greeting");
+    });
+    test("stores group member avatars independently", () => {
+        seedCharacterWithExtensions("char1", appearanceExtensions);
+        seedCharacterWithExtensions("char2", appearanceExtensions);
+        getDb().query("UPDATE characters SET alternate_greetings = ? WHERE id IN (?, ?)")
+            .run(JSON.stringify(["Winter hello"]), "char1", "char2");
+        seedChat("chat1", "char1", "Group", JSON.stringify({ group: true, character_ids: ["char1", "char2"] }), 1);
+        const result = applyChatAppearance("u1", "chat1", {
+            type: "field",
+            field: "description",
+            variant_id: "winter-desc",
+            character_id: "char2",
+        });
+        expect(result?.chat.metadata.group_active_avatar_ids).toEqual({ char2: "winter-image" });
+        expect(result?.chat.metadata.group_alternate_field_selections.char2).toEqual({
+            description: "winter-desc",
+            personality: "warm",
+        });
+        expect(result?.chat.metadata.active_avatar_id).toBeUndefined();
+    });
+    test("applies an avatar selection to the addressed group member, not the chat owner", () => {
+        seedCharacterWithExtensions("char1", appearanceExtensions);
+        seedCharacterWithExtensions("char2", appearanceExtensions);
+        getDb().query("UPDATE characters SET alternate_greetings = ? WHERE id IN (?, ?)")
+            .run(JSON.stringify(["Winter hello"]), "char1", "char2");
+        seedChat("chat1", "char1", "Group", JSON.stringify({ group: true, character_ids: ["char1", "char2"] }), 1);
+        const result = applyChatAppearance("u1", "chat1", {
+            type: "avatar",
+            avatar_entry_id: "winter-avatar",
+            character_id: "char2",
+        });
+        expect(result?.chat.metadata.group_active_avatar_ids).toEqual({ char2: "winter-image" });
+        expect(result?.chat.metadata.group_active_avatar_entry_ids).toEqual({ char2: "winter-avatar" });
+        expect(result?.chat.metadata.group_active_greeting_indices).toEqual({ char2: 1 });
+        expect(result?.chat.metadata.active_avatar_id).toBeUndefined();
+    });
+});

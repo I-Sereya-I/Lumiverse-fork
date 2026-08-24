@@ -1,0 +1,491 @@
+import { getDb } from "../db/connection";
+import * as embeddingsSvc from "./embeddings.service";
+import { getReasoningStripOptions } from "../utils/reasoning-strip";
+import { resolveAndSanitizeForVectorization } from "./vectorization-content.service";
+import { buildMacroEnvForChat } from "./chats.service";
+const MAX_STALE_VISIBLE_MESSAGES = 2;
+const REFRESH_DEBOUNCE_MS = 100;
+const EMPTY_RESULT = {
+    chunks: [],
+    formatted: "",
+    count: 0,
+    enabled: false,
+    queryPreview: "",
+    settingsSource: "global",
+    chunksAvailable: 0,
+    chunksPending: 0,
+};
+function rowToMemoryMessage(row) {
+    return {
+        id: row.id,
+        is_user: !!row.is_user,
+        name: row.name,
+        content: row.content,
+        extra: safeJsonObject(row.extra),
+    };
+}
+function safeJsonObject(raw) {
+    if (!raw)
+        return {};
+    try {
+        return JSON.parse(raw);
+    }
+    catch {
+        return {};
+    }
+}
+function safeJsonArray(raw, fallback = []) {
+    if (!raw)
+        return fallback;
+    try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed : fallback;
+    }
+    catch {
+        return fallback;
+    }
+}
+function truncateToContextSize(text, maxTokens) {
+    const maxChars = maxTokens * 3;
+    if (text.length <= maxChars)
+        return text;
+    return text.slice(-maxChars);
+}
+async function buildQueryText(messages, settings, env, reasoningStrip) {
+    const visibleMessages = messages.filter(m => !(m.extra?.hidden) && m.content.trim().length > 0);
+    const contextSize = Math.max(1, settings.queryContextSize);
+    switch (settings.queryStrategy) {
+        case "last_user_message": {
+            const lastUser = [...visibleMessages].reverse().find(m => m.is_user);
+            if (!lastUser)
+                return "";
+            const sanitized = await resolveAndSanitizeForVectorization(lastUser.content, env, reasoningStrip);
+            return truncateToContextSize(`[USER | ${lastUser.name}]: ${sanitized}`, settings.queryMaxTokens);
+        }
+        case "weighted_recent": {
+            const queryMessages = visibleMessages.slice(-contextSize);
+            const parts = await Promise.all(queryMessages.map(async (m) => {
+                const sanitized = await resolveAndSanitizeForVectorization(m.content, env, reasoningStrip);
+                return `[${m.is_user ? "USER" : "CHARACTER"} | ${m.name}]: ${sanitized}`;
+            }));
+            if (parts.length > 0)
+                parts.push(parts[parts.length - 1]);
+            return truncateToContextSize(parts.join("\n").trim(), settings.queryMaxTokens);
+        }
+        case "recent_messages":
+        default: {
+            const queryMessages = visibleMessages.slice(-contextSize);
+            const parts = await Promise.all(queryMessages.map(async (m) => {
+                const sanitized = await resolveAndSanitizeForVectorization(m.content, env, reasoningStrip);
+                return `[${m.is_user ? "USER" : "CHARACTER"} | ${m.name}]: ${sanitized}`;
+            }));
+            return truncateToContextSize(parts.join("\n").trim(), settings.queryMaxTokens);
+        }
+    }
+}
+function formatMemoryOutput(chunks, settings) {
+    if (chunks.length === 0)
+        return "";
+    const renderedChunks = chunks.map(c => {
+        let rendered = settings.chunkTemplate;
+        rendered = rendered.replace(/\{\{content\}\}/g, c.content);
+        rendered = rendered.replace(/\{\{score\}\}/g, c.score != null ? c.score.toFixed(4) : "n/a");
+        const meta = c.metadata ?? {};
+        rendered = rendered.replace(/\{\{startIndex\}\}/g, String(meta.startIndex ?? "?"));
+        rendered = rendered.replace(/\{\{endIndex\}\}/g, String(meta.endIndex ?? "?"));
+        return rendered;
+    });
+    const joined = renderedChunks.join(settings.chunkSeparator);
+    return settings.memoryHeaderTemplate.replace(/\{\{memories\}\}/g, joined);
+}
+function computeSettingsKey(settings, perChatOverrides, hybridWeightMode) {
+    const raw = JSON.stringify({
+        queryStrategy: settings.queryStrategy,
+        queryContextSize: settings.queryContextSize,
+        queryMaxTokens: settings.queryMaxTokens,
+        retrievalTopK: perChatOverrides?.retrievalTopK ?? settings.retrievalTopK,
+        exclusionWindow: perChatOverrides?.exclusionWindow ?? settings.exclusionWindow,
+        similarityThreshold: settings.similarityThreshold,
+        memoryHeaderTemplate: settings.memoryHeaderTemplate,
+        chunkTemplate: settings.chunkTemplate,
+        chunkSeparator: settings.chunkSeparator,
+        hybridWeightMode,
+    });
+    // FNV-32 has only 2^32 outputs, so two distinct settings combinations would
+    // collide after roughly 65k unique payloads (birthday paradox). On a hit the
+    // cache would return the wrong precomputed memories. SHA-256 puts the
+    // collision probability beyond any practical concern.
+    const hasher = new Bun.CryptoHasher("sha256");
+    hasher.update(raw);
+    return hasher.digest("hex");
+}
+function getVisibleMessageCount(messages) {
+    return messages.filter(m => !(m.extra?.hidden) && m.content.trim().length > 0).length;
+}
+function getRecentFallbackChunks(chatId, limit, excludeMessageIds) {
+    // Over-fetch when excluding so we can drop just-seen chunks (the exclusion
+    // window) and still return up to `limit` genuinely older chunks.
+    const hasExclusions = !!excludeMessageIds && excludeMessageIds.size > 0;
+    const fetchLimit = hasExclusions ? limit + Math.min(excludeMessageIds.size, 50) : limit;
+    const rows = getDb()
+        .query(`SELECT id, content, message_ids FROM chat_chunks
+       WHERE chat_id = ?
+       ORDER BY created_at DESC
+       LIMIT ?`)
+        .all(chatId, fetchLimit);
+    const out = [];
+    for (const row of rows) {
+        const messageIds = safeJsonArray(row.message_ids, []);
+        if (hasExclusions && messageIds.some((id) => excludeMessageIds.has(id)))
+            continue;
+        out.push({
+            content: row.content,
+            // Recency fallback carries no vector measurement — null (not 0) so it is
+            // not mistaken for a perfect-distance match in diagnostics or filters.
+            score: null,
+            metadata: { chunkId: row.id, messageIds },
+        });
+        if (out.length >= limit)
+            break;
+    }
+    return out;
+}
+function getChatMemoryContext(userId, chatId) {
+    const chatRow = getDb()
+        .query("SELECT metadata FROM chats WHERE id = ? AND user_id = ?")
+        .get(chatId, userId);
+    if (!chatRow) {
+        return { exists: false, messages: [], perChatOverrides: null };
+    }
+    const metadata = safeJsonObject(chatRow.metadata);
+    const rows = getDb()
+        .query(`SELECT id, is_user, name, content, extra, index_in_chat
+       FROM messages
+       WHERE chat_id = ?
+       ORDER BY index_in_chat ASC`)
+        .all(chatId);
+    return {
+        exists: true,
+        messages: rows.map(rowToMemoryMessage),
+        perChatOverrides: metadata.memory_settings ?? null,
+    };
+}
+function readCacheRow(chatId, settingsKey) {
+    return getDb()
+        .query("SELECT * FROM chat_memory_cache WHERE chat_id = ? AND settings_key = ?")
+        .get(chatId, settingsKey);
+}
+function toCachedResult(row) {
+    return {
+        chunks: safeJsonArray(row.chunks_json, []),
+        formatted: row.formatted,
+        count: row.count,
+        enabled: !!row.enabled,
+        queryPreview: row.query_preview,
+        settingsSource: row.settings_source,
+        chunksAvailable: row.chunks_available,
+        chunksPending: row.chunks_pending,
+        retrievalMode: row.retrieval_mode,
+    };
+}
+function upsertCacheRow(userId, chatId, settingsKey, sourceMessageCount, result, retrievalMode) {
+    const now = Math.floor(Date.now() / 1000);
+    getDb()
+        .query(`INSERT INTO chat_memory_cache (
+         id, user_id, chat_id, settings_key, source_message_count, query_preview,
+         chunks_json, formatted, count, enabled, settings_source, chunks_available,
+         chunks_pending, retrieval_mode, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(chat_id, settings_key) DO UPDATE SET
+         user_id = excluded.user_id,
+         source_message_count = excluded.source_message_count,
+         query_preview = excluded.query_preview,
+         chunks_json = excluded.chunks_json,
+         formatted = excluded.formatted,
+         count = excluded.count,
+         enabled = excluded.enabled,
+         settings_source = excluded.settings_source,
+         chunks_available = excluded.chunks_available,
+         chunks_pending = excluded.chunks_pending,
+         retrieval_mode = excluded.retrieval_mode,
+         updated_at = excluded.updated_at`)
+        .run(crypto.randomUUID(), userId, chatId, settingsKey, sourceMessageCount, result.queryPreview, JSON.stringify(result.chunks), result.formatted, result.count, result.enabled ? 1 : 0, result.settingsSource, result.chunksAvailable, result.chunksPending, retrievalMode, now, now);
+}
+async function computeFreshMemoryResult(userId, chatId, messages, chatMemorySettings, perChatOverrides) {
+    if (perChatOverrides?.enabled === false) {
+        return {
+            settingsKey: "disabled",
+            sourceMessageCount: getVisibleMessageCount(messages),
+            result: { ...EMPTY_RESULT, enabled: false, settingsSource: "per_chat" },
+            retrievalMode: "disabled",
+        };
+    }
+    const cfg = await embeddingsSvc.getEmbeddingConfig(userId);
+    const settings = embeddingsSvc.resolveEffectiveChatMemorySettings(chatMemorySettings, cfg);
+    const settingsSource = perChatOverrides ? "per_chat" : "global";
+    const sourceMessageCount = getVisibleMessageCount(messages);
+    const reasoningStrip = getReasoningStripOptions(userId);
+    const env = buildMacroEnvForChat(userId, chatId);
+    const queryText = await buildQueryText(messages, settings, env, reasoningStrip);
+    const settingsKey = computeSettingsKey(settings, perChatOverrides, cfg.hybrid_weight_mode);
+    const chunkStats = getDb()
+        .query(`SELECT
+         COUNT(*) as total,
+         SUM(CASE WHEN vectorized_at IS NOT NULL THEN 1 ELSE 0 END) as vectorized
+       FROM chat_chunks
+       WHERE chat_id = ?`)
+        .get(chatId);
+    const chunksAvailable = chunkStats?.total ?? 0;
+    const chunksPending = chunksAvailable - (chunkStats?.vectorized ?? 0);
+    const queryPreview = queryText.slice(0, 200);
+    if (!cfg.enabled || !cfg.vectorize_chat_messages) {
+        return {
+            settingsKey,
+            sourceMessageCount,
+            result: {
+                ...EMPTY_RESULT,
+                enabled: false,
+                queryPreview,
+                settingsSource,
+                chunksAvailable,
+                chunksPending,
+            },
+            retrievalMode: "disabled",
+        };
+    }
+    if (!queryText || chunksAvailable === 0) {
+        return {
+            settingsKey,
+            sourceMessageCount,
+            result: {
+                ...EMPTY_RESULT,
+                enabled: true,
+                queryPreview,
+                settingsSource,
+                chunksAvailable,
+                chunksPending,
+            },
+            retrievalMode: "empty",
+        };
+    }
+    const effectiveTopK = perChatOverrides?.retrievalTopK ?? settings.retrievalTopK;
+    // Per-chat overrides aren't run through normalizeChatMemorySettings, so a
+    // legacy or hand-crafted override could exceed the clamp. Cap defensively
+    // — extreme values stress chunk-retrieval payloads without improving recall.
+    const rawExclusionWindow = perChatOverrides?.exclusionWindow ?? settings.exclusionWindow;
+    const effectiveExclusionWindow = Math.max(5, Math.min(50, rawExclusionWindow));
+    const effectiveThreshold = settings.similarityThreshold;
+    // Recent messages are excluded from retrieval (they're already in live
+    // context). Computed up front so the recency fallback paths can honor it too
+    // instead of returning just-seen messages as "long-term" memory.
+    const excludeIds = new Set();
+    {
+        const visibleMessages = messages.filter(m => !(m.extra?.hidden) && m.content.trim().length > 0);
+        for (const message of visibleMessages.slice(-effectiveExclusionWindow)) {
+            excludeIds.add(message.id);
+        }
+    }
+    if (chunksPending > 0) {
+        const chunks = getRecentFallbackChunks(chatId, effectiveTopK, excludeIds);
+        return {
+            settingsKey,
+            sourceMessageCount,
+            result: {
+                chunks,
+                formatted: formatMemoryOutput(chunks, settings),
+                count: chunks.length,
+                enabled: true,
+                queryPreview,
+                settingsSource,
+                chunksAvailable,
+                chunksPending,
+            },
+            retrievalMode: chunks.length > 0 ? "recency" : "empty",
+        };
+    }
+    try {
+        // Shrink-and-retry on oversized-input errors so a long multi-message query
+        // doesn't silently collapse to the recency fallback on token-limited
+        // embedding backends (llama.cpp n_ubatch, 512-token models, etc.).
+        const queryVector = await embeddingsSvc.embedQueryAdaptive(userId, queryText);
+        if (!queryVector || queryVector.length === 0) {
+            return {
+                settingsKey,
+                sourceMessageCount,
+                result: {
+                    ...EMPTY_RESULT,
+                    enabled: true,
+                    queryPreview,
+                    settingsSource,
+                    chunksAvailable,
+                    chunksPending,
+                },
+                retrievalMode: "empty",
+            };
+        }
+        const hits = await embeddingsSvc.searchChatChunks(userId, chatId, queryVector, excludeIds, effectiveTopK, queryText, cfg.hybrid_weight_mode, undefined, undefined, 
+        // Skip the vector column in chat-memory retrievals. MMR degrades to
+        // distance-ordered top-K — diversity is nice-to-have, but pulling 4 MB
+        // of Float32 vectors per query through Lance/Arrow has been Bun-fragile
+        // in 1.3.12+ and the exclusion filter above already prevents most
+        // duplicate-content hits.
+        { skipVectorFetch: true });
+        // The similarity threshold gates on vector distance (lower = closer). A
+        // keyword-only hit has no distance (score === null) and can't clear a
+        // distance cutoff, so drop it when filtering is active. With threshold 0
+        // (the default) nothing is filtered and keyword hits are kept.
+        const filteredHits = effectiveThreshold > 0
+            ? hits.filter(h => h.score != null && h.score <= effectiveThreshold)
+            : hits;
+        const chunks = filteredHits.map(h => ({
+            content: h.content,
+            score: h.score,
+            metadata: h.metadata ?? {},
+        }));
+        return {
+            settingsKey,
+            sourceMessageCount,
+            result: {
+                chunks,
+                formatted: formatMemoryOutput(chunks, settings),
+                count: chunks.length,
+                enabled: true,
+                queryPreview,
+                settingsSource,
+                chunksAvailable,
+                chunksPending,
+            },
+            retrievalMode: chunks.length > 0 ? "vector" : "empty",
+        };
+    }
+    catch (err) {
+        console.warn("[chat-memory-cache] Background refresh failed, storing recency fallback:", err);
+        const chunks = getRecentFallbackChunks(chatId, effectiveTopK, excludeIds);
+        return {
+            settingsKey,
+            sourceMessageCount,
+            result: {
+                chunks,
+                formatted: formatMemoryOutput(chunks, settings),
+                count: chunks.length,
+                enabled: true,
+                queryPreview,
+                settingsSource,
+                chunksAvailable,
+                chunksPending,
+            },
+            retrievalMode: chunks.length > 0 ? "recency" : "empty",
+        };
+    }
+}
+class ChatMemoryRefreshQueue {
+    queue = [];
+    processing = false;
+    timer = null;
+    add(job) {
+        const existing = this.queue.findIndex((entry) => entry.userId === job.userId && entry.chatId === job.chatId);
+        if (existing >= 0) {
+            this.queue[existing].priority = Math.max(this.queue[existing].priority, job.priority);
+        }
+        else {
+            this.queue.push(job);
+        }
+        this.queue.sort((a, b) => b.priority - a.priority);
+        this.schedule();
+    }
+    schedule() {
+        if (this.timer)
+            return;
+        this.timer = setTimeout(() => {
+            this.timer = null;
+            void this.process();
+        }, REFRESH_DEBOUNCE_MS);
+    }
+    async process() {
+        if (this.processing)
+            return;
+        this.processing = true;
+        try {
+            while (this.queue.length > 0) {
+                const job = this.queue.shift();
+                await refreshChatMemoryCache(job.userId, job.chatId);
+            }
+        }
+        finally {
+            this.processing = false;
+            if (this.queue.length > 0)
+                this.schedule();
+        }
+    }
+}
+const refreshQueue = new ChatMemoryRefreshQueue();
+export function scheduleChatMemoryRefresh(userId, chatId, priority = 5) {
+    refreshQueue.add({ userId, chatId, priority });
+}
+export async function readCachedChatMemory(userId, chatId, messages, chatMemorySettings, perChatOverrides) {
+    if (perChatOverrides?.enabled === false) {
+        return { ...EMPTY_RESULT, enabled: false, settingsSource: "per_chat" };
+    }
+    const cfg = await embeddingsSvc.getEmbeddingConfig(userId);
+    if (!cfg.enabled || !cfg.vectorize_chat_messages) {
+        return { ...EMPTY_RESULT, enabled: false };
+    }
+    const messageViews = messages.map((message) => ({
+        id: message.id,
+        is_user: message.is_user,
+        name: message.name,
+        content: message.content,
+        extra: message.extra ?? {},
+    }));
+    const settings = embeddingsSvc.resolveEffectiveChatMemorySettings(chatMemorySettings, cfg);
+    const settingsSource = perChatOverrides ? "per_chat" : "global";
+    const reasoningStrip = getReasoningStripOptions(userId);
+    const env = buildMacroEnvForChat(userId, chatId);
+    const queryText = await buildQueryText(messageViews, settings, env, reasoningStrip);
+    if (!queryText) {
+        return { ...EMPTY_RESULT, enabled: true, settingsSource };
+    }
+    const settingsKey = computeSettingsKey(settings, perChatOverrides, cfg.hybrid_weight_mode);
+    const row = readCacheRow(chatId, settingsKey);
+    const visibleMessageCount = getVisibleMessageCount(messageViews);
+    if (!row) {
+        scheduleChatMemoryRefresh(userId, chatId, 9);
+        return {
+            ...EMPTY_RESULT,
+            enabled: true,
+            queryPreview: queryText.slice(0, 200),
+            settingsSource,
+        };
+    }
+    const delta = visibleMessageCount - row.source_message_count;
+    if (delta > 0) {
+        scheduleChatMemoryRefresh(userId, chatId, delta > MAX_STALE_VISIBLE_MESSAGES ? 9 : 6);
+    }
+    if (delta < 0 || delta > MAX_STALE_VISIBLE_MESSAGES) {
+        return {
+            ...EMPTY_RESULT,
+            enabled: !!row.enabled,
+            queryPreview: queryText.slice(0, 200),
+            settingsSource: row.settings_source,
+            chunksAvailable: row.chunks_available,
+            chunksPending: row.chunks_pending,
+        };
+    }
+    return toCachedResult(row);
+}
+export async function refreshChatMemoryCache(userId, chatId) {
+    const context = getChatMemoryContext(userId, chatId);
+    if (!context.exists) {
+        invalidateChatMemoryCache(chatId);
+        return;
+    }
+    const chatMemorySettings = embeddingsSvc.loadChatMemorySettings(userId);
+    const refreshed = await computeFreshMemoryResult(userId, chatId, context.messages, chatMemorySettings, context.perChatOverrides);
+    upsertCacheRow(userId, chatId, refreshed.settingsKey, refreshed.sourceMessageCount, refreshed.result, refreshed.retrievalMode);
+}
+export function invalidateChatMemoryCache(chatId) {
+    getDb().query("DELETE FROM chat_memory_cache WHERE chat_id = ?").run(chatId);
+}
+export function clearAllChatMemoryCache() {
+    getDb().query("DELETE FROM chat_memory_cache").run();
+}

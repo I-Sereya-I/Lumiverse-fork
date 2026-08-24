@@ -433,6 +433,7 @@ export function useMessageCard(message: Message, chatId: string) {
         content: cleanContent,
         expectedVersion,
         requestId,
+        branchChat: useStore.getState().quickToolbarSettings.branchChatOnEditAndSend !== false,
       })
       const messageLimit = useStore.getState().messagesPerPage || 50
       await preloadChatNavigationSnapshotById(result.branchChatId, messageLimit).catch((err) => {

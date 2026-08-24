@@ -89,6 +89,7 @@ import InputAreaCustomizeModal, {
   type ComposerActionId,
 } from './InputAreaCustomizeModal'
 import { ComposerActionBarLive } from './InputAreaComposerBar'
+import { isExtensionComposerActionId } from './composerActionOwnership'
 
 interface InputAreaProps {
   chatId: string
@@ -3399,9 +3400,14 @@ function InputAreaNative({ chatId, onNavigateHome, onOpenChatFind }: InputAreaPr
               reorder={composerActionBar.reorder}
               enableReorder={enableToolbarIconReorder}
               renderUnit={(id) => {
-                if (isComposerActionId(id)) return composerActions[id]
-                if (fromComposerExtraId(id) === 'lumiverse_suite.connections_picker.open') return composerActions.connectionsPicker
-                const action = qtActionById.get(fromComposerExtraId(id))
+                if (isComposerActionId(id)) {
+                  if (!hasLumiverseSuite && isExtensionComposerActionId(id)) return null
+                  return composerActions[id]
+                }
+                const extraId = fromComposerExtraId(id)
+                if (!hasLumiverseSuite && isExtensionComposerActionId(extraId)) return null
+                if (extraId === 'lumiverse_suite.connections_picker.open') return composerActions.connectionsPicker
+                const action = qtActionById.get(extraId)
                 if (!action || action.hidden) return null
                 const Icon = action.icon
                 return (

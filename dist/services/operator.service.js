@@ -1,0 +1,314 @@
+import { RingBuffer } from "../utils/ring-buffer";
+import { eventBus } from "../ws/bus";
+import { EventType } from "../ws/events";
+import { env } from "../env";
+import { getDatabasePath, getDb } from "../db/connection";
+import { collectDatabaseStats, getDatabaseMaintenanceSettingKey, getDatabaseMaintenanceStateSettingKey, getDatabaseTuningSettingKey, readDatabaseMaintenanceSettings, readDatabaseMaintenanceState, readDatabaseTuningSettings, resolveDatabaseTuning, runDatabaseMaintenance, } from "../db/maintenance";
+import { getAutomaticDatabaseMaintenanceStatus } from "../db/maintenance-scheduler";
+import { getGitMetadata } from "../utils/git-metadata";
+// ─── Static metadata helpers ────────────────────────────────────────────────
+function readVersion() {
+    try {
+        const pkg = require("../../package.json");
+        return pkg.version || "unknown";
+    }
+    catch {
+        return "unknown";
+    }
+}
+// ─── OperatorService ────────────────────────────────────────────────────────
+class OperatorService {
+    ipcAvailable;
+    ipcReason;
+    logBuffer;
+    pendingRequests = new Map();
+    startedAt = Date.now();
+    logSubscribers = new Set(); // userIds
+    batchPending = [];
+    batchTimer = null;
+    currentOperation = null;
+    // Cached values that don't change during server lifetime
+    version = readVersion();
+    constructor() {
+        const hasRunnerEnv = process.env.LUMIVERSE_RUNNER_IPC === "1";
+        const hasProcessSend = typeof process.send === "function";
+        this.ipcAvailable = hasRunnerEnv && hasProcessSend;
+        this.ipcReason = this.ipcAvailable
+            ? "connected"
+            : hasRunnerEnv
+                ? "runner_env_without_process_send"
+                : "not_started_with_runner";
+        this.logBuffer = new RingBuffer(150);
+        if (this.ipcAvailable) {
+            process.on("message", (msg) => this.handleRunnerMessage(msg));
+        }
+        this.interceptConsole();
+    }
+    // ── Log capture ─────────────────────────────────────────────────────────
+    interceptConsole() {
+        const origLog = console.log;
+        const origWarn = console.warn;
+        const origError = console.error;
+        console.log = (...args) => {
+            origLog(...args);
+            this.captureEntry("stdout", args);
+        };
+        console.warn = (...args) => {
+            origWarn(...args);
+            this.captureEntry("stderr", args);
+        };
+        console.error = (...args) => {
+            origError(...args);
+            this.captureEntry("stderr", args);
+        };
+    }
+    captureEntry(source, args) {
+        const text = args
+            .map((a) => (typeof a === "string" ? a : JSON.stringify(a)))
+            .join(" ");
+        const entry = { timestamp: Date.now(), source, text };
+        this.logBuffer.push(entry);
+        // Batch for WS streaming
+        if (this.logSubscribers.size > 0) {
+            this.batchPending.push(entry);
+            if (!this.batchTimer) {
+                this.batchTimer = setTimeout(() => this.flushLogBatch(), 200);
+            }
+        }
+    }
+    flushLogBatch() {
+        this.batchTimer = null;
+        if (this.batchPending.length === 0)
+            return;
+        const entries = this.batchPending;
+        this.batchPending = [];
+        for (const userId of this.logSubscribers) {
+            eventBus.emit(EventType.OPERATOR_LOG, { entries }, userId);
+        }
+    }
+    // ── Log subscription ──────────────────────────────────────────────────
+    subscribeLogs(userId) {
+        this.logSubscribers.add(userId);
+    }
+    unsubscribeLogs(userId) {
+        this.logSubscribers.delete(userId);
+    }
+    getLogs(limit) {
+        return this.logBuffer.last(limit);
+    }
+    setLogBufferSize(size) {
+        const clamped = Math.max(50, Math.min(2000, size));
+        this.logBuffer.resize(clamped);
+    }
+    // ── Status ────────────────────────────────────────────────────────────
+    getLocalStatus() {
+        const git = getGitMetadata();
+        return {
+            port: env.port,
+            pid: process.pid,
+            uptime: Date.now() - this.startedAt,
+            branch: git.branch,
+            version: this.version,
+            commit: git.commit,
+            remoteMode: env.trustAnyOrigin,
+            ipcAvailable: this.ipcAvailable,
+            ipcReason: this.ipcReason,
+        };
+    }
+    async getFullStatus() {
+        const local = this.getLocalStatus();
+        // If IPC is available, ask runner for update info
+        if (this.ipcAvailable) {
+            try {
+                const data = await this.sendToRunner("status", undefined, 10_000);
+                return {
+                    ...local,
+                    updateAvailable: data?.updateAvailable ?? false,
+                    commitsBehind: data?.commitsBehind ?? 0,
+                    latestUpdateMessage: data?.latestUpdateMessage ?? "",
+                };
+            }
+            catch {
+                return { ...local, updateAvailable: false, commitsBehind: 0, latestUpdateMessage: "" };
+            }
+        }
+        return { ...local, updateAvailable: false, commitsBehind: 0, latestUpdateMessage: "" };
+    }
+    async getDatabaseStatus(userId) {
+        const db = getDb();
+        const dbPath = getDatabasePath();
+        const stats = collectDatabaseStats(db, dbPath);
+        const configuredSettings = readDatabaseTuningSettings(db, userId);
+        const maintenanceSettings = readDatabaseMaintenanceSettings(db, userId);
+        const maintenanceState = readDatabaseMaintenanceState(db, userId);
+        const effectiveTuning = resolveDatabaseTuning(stats, db, userId);
+        const automaticMaintenance = await getAutomaticDatabaseMaintenanceStatus(db, userId, dbPath, this.busy);
+        return {
+            settingsKey: getDatabaseTuningSettingKey(),
+            maintenanceSettingsKey: getDatabaseMaintenanceSettingKey(),
+            maintenanceStateKey: getDatabaseMaintenanceStateSettingKey(),
+            configuredSettings,
+            maintenanceSettings,
+            maintenanceState,
+            effectiveTuning,
+            stats,
+            recommendation: {
+                cacheMemoryPercent: effectiveTuning.cacheMemoryPercent,
+                cacheBytes: effectiveTuning.cacheBytes,
+                mmapSizeBytes: effectiveTuning.mmapSizeBytes,
+            },
+            automaticMaintenance,
+        };
+    }
+    async maintainDatabase(userId, options) {
+        return this.runOperation("database-maintenance", async () => {
+            return runDatabaseMaintenance(getDb(), {
+                dbPath: getDatabasePath(),
+                userId,
+                optimize: options.optimize,
+                analyze: options.analyze,
+                vacuum: options.vacuum,
+                refreshTuning: options.refreshTuning,
+                checkpointMode: options.checkpointMode,
+            });
+        });
+    }
+    // ── IPC bridge ────────────────────────────────────────────────────────
+    async sendToRunner(type, payload, timeoutMs = 120_000) {
+        if (!this.ipcAvailable) {
+            throw new Error("Runner IPC not available");
+        }
+        const id = crypto.randomUUID();
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this.pendingRequests.delete(id);
+                reject(new Error("IPC timeout"));
+            }, timeoutMs);
+            this.pendingRequests.set(id, { resolve, reject, timer });
+            process.send({ type, id, payload });
+        });
+    }
+    handleRunnerMessage(msg) {
+        if (!msg || !msg.type)
+            return;
+        if (msg.type === "response" && msg.id) {
+            const pending = this.pendingRequests.get(msg.id);
+            if (pending) {
+                this.pendingRequests.delete(msg.id);
+                clearTimeout(pending.timer);
+                const p = msg.payload;
+                if (p?.success) {
+                    pending.resolve(p.data);
+                }
+                else {
+                    pending.reject(new Error(p?.error || "IPC request failed"));
+                }
+            }
+            return;
+        }
+        if (msg.type === "progress" && msg.id) {
+            const p = msg.payload;
+            // Broadcast progress to all log subscribers
+            for (const userId of this.logSubscribers) {
+                eventBus.emit(EventType.OPERATOR_PROGRESS, {
+                    operation: p?.operation ?? "unknown",
+                    status: "in_progress",
+                    message: p?.message ?? "",
+                }, userId);
+            }
+            return;
+        }
+    }
+    // ── Operation mutex ───────────────────────────────────────────────────
+    get busy() {
+        return this.currentOperation;
+    }
+    async runOperation(name, fn) {
+        if (this.currentOperation) {
+            throw new OperationConflictError(this.currentOperation);
+        }
+        this.currentOperation = name;
+        try {
+            // Broadcast start
+            for (const userId of this.logSubscribers) {
+                eventBus.emit(EventType.OPERATOR_PROGRESS, {
+                    operation: name,
+                    status: "in_progress",
+                    message: `Starting ${name}...`,
+                }, userId);
+            }
+            const result = await fn();
+            // Broadcast complete
+            for (const userId of this.logSubscribers) {
+                eventBus.emit(EventType.OPERATOR_PROGRESS, {
+                    operation: name,
+                    status: "complete",
+                    message: `${name} complete`,
+                }, userId);
+            }
+            return result;
+        }
+        catch (err) {
+            for (const userId of this.logSubscribers) {
+                eventBus.emit(EventType.OPERATOR_PROGRESS, {
+                    operation: name,
+                    status: "error",
+                    message: err instanceof Error ? err.message : "Unknown error",
+                }, userId);
+            }
+            throw err;
+        }
+        finally {
+            this.currentOperation = null;
+        }
+    }
+    // ── IPC-backed operations ─────────────────────────────────────────────
+    async checkUpdates() {
+        return this.sendToRunner("check-updates", undefined, 30_000);
+    }
+    async applyUpdate() {
+        return this.runOperation("update", () => this.sendToRunner("apply-update", undefined, 300_000));
+    }
+    async switchBranch(target) {
+        return this.runOperation("branch-switch", () => this.sendToRunner("switch-branch", { target }, 300_000));
+    }
+    async toggleRemote(enable) {
+        return this.runOperation("remote-toggle", () => this.sendToRunner("toggle-remote", { enable }, 30_000));
+    }
+    async restart() {
+        return this.runOperation("restart", () => this.sendToRunner("restart", undefined, 15_000));
+    }
+    async shutdown() {
+        return this.sendToRunner("quit", undefined, 10_000);
+    }
+    async clearCache() {
+        return this.sendToRunner("clear-cache", undefined, 60_000);
+    }
+    async ensureDependencies() {
+        return this.sendToRunner("ensure-deps", undefined, 120_000);
+    }
+    async rebuildFrontend() {
+        return this.runOperation("rebuild", () => this.sendToRunner("rebuild-frontend", undefined, 300_000));
+    }
+    // ── Cleanup ───────────────────────────────────────────────────────────
+    cleanup() {
+        if (this.batchTimer) {
+            clearTimeout(this.batchTimer);
+            this.batchTimer = null;
+        }
+        this.logSubscribers.clear();
+        for (const [id, pending] of this.pendingRequests) {
+            clearTimeout(pending.timer);
+            pending.reject(new Error("Service shutting down"));
+        }
+        this.pendingRequests.clear();
+    }
+}
+export class OperationConflictError extends Error {
+    currentOperation;
+    constructor(currentOperation) {
+        super(`Operation '${currentOperation}' already in progress`);
+        this.currentOperation = currentOperation;
+    }
+}
+export const operatorService = new OperatorService();

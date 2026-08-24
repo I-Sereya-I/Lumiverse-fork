@@ -1,0 +1,60 @@
+import { OpenAIProvider } from "./providers/openai";
+import { AnthropicProvider } from "./providers/anthropic";
+import { GoogleProvider } from "./providers/google";
+import { OpenRouterProvider } from "./providers/openrouter";
+import { DeepSeekProvider } from "./providers/deepseek";
+import { ChutesProvider } from "./providers/chutes";
+import { NanoGPTProvider } from "./providers/nanogpt";
+import { ZAIProvider } from "./providers/zai";
+import { MoonshotProvider } from "./providers/moonshot";
+import { MistralProvider } from "./providers/mistral";
+import { AI21Provider } from "./providers/ai21";
+import { PerplexityProvider } from "./providers/perplexity";
+import { GroqProvider } from "./providers/groq";
+import { XAIProvider } from "./providers/xai";
+import { ElectronHubProvider } from "./providers/electronhub";
+import { FireworksProvider } from "./providers/fireworks";
+import { PollinationsProvider } from "./providers/pollinations";
+import { PollinationsTextProvider } from "./providers/pollinations-text";
+import { SiliconFlowProvider } from "./providers/siliconflow";
+import { InfermaticProvider } from "./providers/infermatic";
+import { CustomProvider } from "./providers/custom";
+import { GoogleVertexProvider } from "./providers/google-vertex";
+import { BedrockProvider } from "./providers/bedrock";
+const providers = new Map();
+export function registerProvider(provider) {
+    providers.set(provider.name, provider);
+}
+export function getProvider(name) {
+    return providers.get(name);
+}
+export function listProviders() {
+    return [...providers.keys()];
+}
+export function getProviderList() {
+    return [...providers.values()];
+}
+// Register built-in providers
+registerProvider(new OpenAIProvider());
+registerProvider(new AnthropicProvider());
+registerProvider(new GoogleProvider());
+registerProvider(new GoogleVertexProvider());
+registerProvider(new BedrockProvider());
+registerProvider(new OpenRouterProvider());
+registerProvider(new DeepSeekProvider());
+registerProvider(new ChutesProvider());
+registerProvider(new NanoGPTProvider());
+registerProvider(new ZAIProvider());
+registerProvider(new MoonshotProvider());
+registerProvider(new MistralProvider());
+registerProvider(new AI21Provider());
+registerProvider(new PerplexityProvider());
+registerProvider(new GroqProvider());
+registerProvider(new XAIProvider());
+registerProvider(new ElectronHubProvider());
+registerProvider(new FireworksProvider());
+registerProvider(new PollinationsTextProvider());
+registerProvider(new PollinationsProvider());
+registerProvider(new SiliconFlowProvider());
+registerProvider(new InfermaticProvider());
+registerProvider(new CustomProvider());

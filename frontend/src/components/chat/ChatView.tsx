@@ -258,8 +258,12 @@ export default function ChatView() {
   const portraitPanelSide = useStore((s) => s.portraitPanelSide)
   const [portraitSurfaceOccupied, setPortraitSurfaceOccupied] = useState(false)
   const quickToolbarSettings = useStore((s) => s.quickToolbarSettings)
+  const hasLumiverseSuite = useStore((state) => ((state as { extensions?: unknown[] }).extensions ?? []).some((extension) => {
+    const candidate = extension as { identifier?: unknown; enabled?: unknown; has_frontend?: unknown }
+    return candidate.identifier === 'lumiverse_suite' && candidate.enabled === true && candidate.has_frontend === true
+  }))
   const quickToolbarPlacement = readQuickToolbarPlacement(quickToolbarSettings)
-  const dockQuickToolbar = quickToolbarPlacement === 'chat_top_dock'
+  const dockQuickToolbar = hasLumiverseSuite && quickToolbarPlacement === 'chat_top_dock'
   const keepFloatingDockHost = quickToolbarPlacement === 'floating' && keepDockEnabledWhenFloating(quickToolbarSettings)
   const chatTopDockRequest = effectiveQuickToolbarDockRequest(
     dockQuickToolbar || keepFloatingDockHost ? 'strip' : 'floating',
@@ -1241,7 +1245,8 @@ export default function ChatView() {
             <div data-spindle-mount="chat_header_left" data-spindle-scope={`chat:${chatId}:header-left`} style={{ display: 'contents' }} />
             <div data-spindle-mount="chat_header_center" data-spindle-scope={`chat:${chatId}:header-center`} style={{ display: 'contents' }} />
             <div data-spindle-mount="chat_header_right" data-spindle-scope={`chat:${chatId}:header-right`} style={{ display: 'contents' }} />
-            <div ref={chatTopDockRef} className={styles.chatToolbar} data-spindle-mount="chat_top_dock" data-spindle-scope={`chat:${chatId}:top-dock`} data-dock-request={chatTopDockRequest}>
+            <div ref={chatTopDockRef} className={styles.chatToolbar} data-spindle-mount="chat_top_dock" data-spindle-scope={`chat:${chatId}:top-dock`} data-dock-request={chatTopDockRequest} data-native-action-side={quickToolbarSettings.nativeDockActionSide ?? 'right'}>
+              <span className={styles.nativeDockActions} data-native-dock-actions="true">
               {isShowNativeSelectMessages(quickToolbarSettings) && (
                 <button
                   type="button"
@@ -1291,6 +1296,7 @@ export default function ChatView() {
                   <Pencil size={14} />
                 </button>
               )}
+              </span>
               {dockQuickToolbar && <QuickToolbar />}
             </div>
             <ChatFindBar

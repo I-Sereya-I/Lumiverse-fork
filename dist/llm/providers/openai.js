@@ -1,0 +1,357 @@
+import { OpenAICompatibleProvider } from "./openai-compatible";
+import { COMMON_PARAMS } from "../param-schema";
+import { cancelStreamAndCloseConnection, createCooperativeYielder, fetchWithPreflightAbort, readJsonWithAbort, readWithAbort } from "../stream-utils";
+import { getTextContent } from "../types";
+import { throwProviderResponseError } from "../../utils/provider-errors";
+export class OpenAIProvider extends OpenAICompatibleProvider {
+    name = "openai";
+    displayName = "OpenAI";
+    defaultUrl = "https://api.openai.com/v1";
+    capabilities = {
+        parameters: {
+            temperature: { ...COMMON_PARAMS.temperature, max: 2 },
+            max_tokens: COMMON_PARAMS.max_tokens,
+            top_p: COMMON_PARAMS.top_p,
+            top_k: COMMON_PARAMS.top_k,
+            frequency_penalty: COMMON_PARAMS.frequency_penalty,
+            presence_penalty: COMMON_PARAMS.presence_penalty,
+            stop: COMMON_PARAMS.stop,
+        },
+        requiresMaxTokens: false,
+        supportsSystemRole: true,
+        supportsStreaming: true,
+        apiKeyRequired: true,
+        modelListStyle: "openai",
+    };
+    // ---------------------------------------------------------------------------
+    // Responses API support (/v1/responses)
+    // ---------------------------------------------------------------------------
+    async generate(apiKey, apiUrl, request) {
+        if (request.parameters?.use_responses_api) {
+            return this.generateResponsesApi(apiKey, apiUrl, request);
+        }
+        return super.generate(apiKey, apiUrl, request);
+    }
+    async *generateStream(apiKey, apiUrl, request) {
+        if (request.parameters?.use_responses_api) {
+            yield* this.generateStreamResponsesApi(apiKey, apiUrl, request);
+            return;
+        }
+        yield* super.generateStream(apiKey, apiUrl, request);
+    }
+    // -- Body building ----------------------------------------------------------
+    /** Format multipart content for the Responses API input format. */
+    formatResponsesContent(m) {
+        if (typeof m.content === "string")
+            return m.content;
+        const out = [];
+        for (const part of m.content) {
+            switch (part.type) {
+                case "text":
+                    out.push({ type: "input_text", text: part.text });
+                    break;
+                case "image":
+                    out.push({ type: "input_image", image_url: `data:${part.mime_type};base64,${part.data}` });
+                    break;
+                case "audio":
+                    out.push({ type: "input_audio", data: part.data, format: part.mime_type.split("/")[1] });
+                    break;
+            }
+        }
+        return out;
+    }
+    // Flatten one LlmMessage into the input-item sequence for /v1/responses.
+    // tool_use becomes a function_call item, tool_result becomes a
+    // function_call_output item. Message items (role+content) are emitted only
+    // when non-tool parts exist.
+    flattenForResponses(m) {
+        if (typeof m.content === "string") {
+            return [{ role: m.role, content: m.content }];
+        }
+        const parts = m.content;
+        const out = [];
+        const nonTool = parts.filter((p) => p.type !== "tool_use" && p.type !== "tool_result");
+        if (nonTool.length > 0) {
+            out.push({ role: m.role, content: this.formatResponsesContent({ ...m, content: nonTool }) });
+        }
+        for (const p of parts) {
+            if (p.type === "tool_use") {
+                out.push({
+                    type: "function_call",
+                    call_id: p.id,
+                    name: p.name,
+                    arguments: JSON.stringify(p.input ?? {}),
+                });
+            }
+            else if (p.type === "tool_result") {
+                out.push({
+                    type: "function_call_output",
+                    call_id: p.tool_use_id,
+                    output: p.content,
+                });
+            }
+        }
+        return out;
+    }
+    /**
+     * Build the request body for OpenAI's /v1/responses endpoint.
+     *
+     * Key differences from /v1/chat/completions:
+     * - `messages` → `input`
+     * - `max_tokens` → `max_output_tokens`
+     * - System messages are extracted into the top-level `instructions` field
+     * - `frequency_penalty`, `presence_penalty`, `stop` are not supported
+     * - Multipart content uses `input_text` / `input_image` / `input_audio` types
+     */
+    buildResponsesBody(request) {
+        const params = request.parameters || {};
+        // Separate system messages → instructions, keep user/assistant as input
+        const systemMessages = request.messages.filter((m) => m.role === "system");
+        const inputMessages = request.messages.filter((m) => m.role !== "system");
+        const body = {
+            model: request.model,
+            input: inputMessages.flatMap((m) => this.flattenForResponses(m)),
+        };
+        if (systemMessages.length > 0) {
+            body.instructions = systemMessages.map((m) => getTextContent(m)).join("\n\n");
+        }
+        // Map supported sampler params
+        if (params.temperature !== undefined)
+            body.temperature = params.temperature;
+        if (params.top_p !== undefined)
+            body.top_p = params.top_p;
+        if (params.top_k !== undefined)
+            body.top_k = params.top_k;
+        if (params.max_tokens !== undefined)
+            body.max_output_tokens = params.max_tokens;
+        // Passthrough: forward any extra params the caller set (e.g. reasoning,
+        // text.format, previous_response_id, store, metadata, etc.)
+        const SKIP_PARAMS = new Set([
+            "use_responses_api",
+            "max_tokens",
+            "temperature",
+            "top_p",
+            // Not supported by Responses API — silently drop
+            "frequency_penalty",
+            "presence_penalty",
+            "stop",
+            // Internal
+            "max_context_length",
+            "_include_usage",
+            "_streaming",
+        ]);
+        for (const key of Object.keys(params)) {
+            if (SKIP_PARAMS.has(key))
+                continue;
+            if (body[key] !== undefined)
+                continue;
+            body[key] = params[key];
+        }
+        // Tools — Responses API uses a slightly different format
+        if (request.tools && request.tools.length > 0) {
+            body.tools = request.tools.map((t) => ({
+                type: "function",
+                name: t.name,
+                description: t.description,
+                parameters: t.parameters,
+            }));
+        }
+        return body;
+    }
+    // -- Non-streaming ----------------------------------------------------------
+    async generateResponsesApi(apiKey, apiUrl, request) {
+        const url = `${this.baseUrl(apiUrl)}/responses`;
+        const body = this.buildResponsesBody(request);
+        const res = await fetchWithPreflightAbort(url, {
+            method: "POST",
+            headers: this.headers(apiKey),
+            body: JSON.stringify(body),
+        }, request.signal);
+        if (!res.ok)
+            await throwProviderResponseError(this.displayName, "responses generate", res);
+        const data = (await readJsonWithAbort(res, request.signal));
+        // Extract text content from response output
+        let content = "";
+        let reasoning;
+        if (data.output_text !== undefined) {
+            // SDK-style shorthand present on the response object
+            content = data.output_text;
+        }
+        const fnCalls = [];
+        if (data.output) {
+            for (const item of data.output) {
+                // Reasoning items (o-series models)
+                if (item.type === "reasoning" && item.summary) {
+                    const parts = Array.isArray(item.summary) ? item.summary : [item.summary];
+                    reasoning = parts
+                        .map((s) => (typeof s === "string" ? s : s.text || ""))
+                        .join("");
+                }
+                // Text message items
+                if (item.type === "message" && item.content && !content) {
+                    for (const part of item.content) {
+                        if (part.type === "output_text") {
+                            content += part.text;
+                        }
+                    }
+                }
+                // Function call items
+                if (item.type === "function_call") {
+                    fnCalls.push({
+                        name: item.name || "",
+                        args: typeof item.arguments === "string" ? JSON.parse(item.arguments) : (item.arguments ?? {}),
+                        call_id: item.call_id || item.id || crypto.randomUUID(),
+                    });
+                }
+            }
+        }
+        const toolCalls = fnCalls.length > 0 ? fnCalls : undefined;
+        return {
+            content,
+            reasoning,
+            finish_reason: toolCalls ? "tool_calls"
+                : data.status === "completed"
+                    ? "stop"
+                    : data.incomplete_details?.reason || data.status || "stop",
+            tool_calls: toolCalls,
+            usage: data.usage
+                ? {
+                    prompt_tokens: data.usage.input_tokens || 0,
+                    completion_tokens: data.usage.output_tokens || 0,
+                    total_tokens: (data.usage.input_tokens || 0) + (data.usage.output_tokens || 0),
+                    // Retain `input_tokens_details.cached_tokens` (and any future
+                    // cache telemetry) so the prompt inspector can report implicit
+                    // OpenAI prompt-cache hits just as it can for Chat Completions.
+                    provider_raw: { ...data.usage },
+                }
+                : undefined,
+        };
+    }
+    // -- Streaming --------------------------------------------------------------
+    async *generateStreamResponsesApi(apiKey, apiUrl, request) {
+        const url = `${this.baseUrl(apiUrl)}/responses`;
+        const body = this.buildResponsesBody(request);
+        body.stream = true;
+        const res = await fetchWithPreflightAbort(url, {
+            method: "POST",
+            headers: this.headers(apiKey),
+            body: JSON.stringify(body),
+        }, request.signal);
+        if (!res.ok)
+            await throwProviderResponseError(this.displayName, "responses stream", res);
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        const maybeYield = createCooperativeYielder(64, request.signal);
+        // Tool call accumulation for Responses API function_call streaming
+        const fnCallBuffer = new Map();
+        let streamDoneNaturally = false;
+        try {
+            while (true) {
+                const { done, value } = await readWithAbort(reader, request.signal);
+                if (done) {
+                    streamDoneNaturally = !request.signal?.aborted;
+                    break;
+                }
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split("\n");
+                buffer = lines.pop() || "";
+                for (const line of lines) {
+                    await maybeYield();
+                    const trimmed = line.trim();
+                    if (!trimmed || !trimmed.startsWith("data: "))
+                        continue;
+                    const payload = trimmed.slice(6);
+                    if (payload === "[DONE]")
+                        return;
+                    try {
+                        const parsed = JSON.parse(payload);
+                        const eventType = parsed.type || "";
+                        switch (eventType) {
+                            // Text content delta
+                            case "response.output_text.delta":
+                                yield { token: parsed.delta || "" };
+                                break;
+                            // Reasoning summary delta (o-series models)
+                            case "response.reasoning_summary_text.delta":
+                                yield { token: "", reasoning: parsed.delta || "" };
+                                break;
+                            // Function call argument streaming
+                            case "response.function_call_arguments.delta": {
+                                const itemId = parsed.item_id || parsed.output_index?.toString() || "0";
+                                const existing = fnCallBuffer.get(itemId);
+                                if (existing) {
+                                    existing.argsJson += parsed.delta || "";
+                                }
+                                break;
+                            }
+                            case "response.function_call_arguments.done": {
+                                const itemId = parsed.item_id || parsed.output_index?.toString() || "0";
+                                const existing = fnCallBuffer.get(itemId);
+                                if (existing && parsed.arguments) {
+                                    existing.argsJson = parsed.arguments;
+                                }
+                                break;
+                            }
+                            // Function call output item added — capture name and call_id
+                            case "response.output_item.added": {
+                                const item = parsed.item;
+                                if (item?.type === "function_call") {
+                                    fnCallBuffer.set(item.id || parsed.output_index?.toString() || String(fnCallBuffer.size), {
+                                        name: item.name || "",
+                                        argsJson: "",
+                                        callId: item.call_id || item.id || crypto.randomUUID(),
+                                    });
+                                }
+                                break;
+                            }
+                            // Response complete — extract usage and emit tool calls
+                            case "response.completed":
+                            case "response.done": {
+                                const resp = parsed.response || parsed;
+                                const usage = resp.usage
+                                    ? {
+                                        prompt_tokens: resp.usage.input_tokens || 0,
+                                        completion_tokens: resp.usage.output_tokens || 0,
+                                        total_tokens: (resp.usage.input_tokens || 0) +
+                                            (resp.usage.output_tokens || 0),
+                                        provider_raw: { ...resp.usage },
+                                    }
+                                    : undefined;
+                                const toolCalls = fnCallBuffer.size > 0
+                                    ? [...fnCallBuffer.values()].map(tc => ({
+                                        name: tc.name,
+                                        args: JSON.parse(tc.argsJson || "{}"),
+                                        call_id: tc.callId,
+                                    }))
+                                    : undefined;
+                                yield {
+                                    token: "",
+                                    finish_reason: toolCalls ? "tool_calls"
+                                        : resp.status === "completed"
+                                            ? "stop"
+                                            : resp.incomplete_details?.reason || resp.status || "stop",
+                                    tool_calls: toolCalls,
+                                    usage,
+                                };
+                                break;
+                            }
+                            // All other events (response.created, response.in_progress,
+                            // response.content_part.added, response.output_text.done,
+                            // response.output_item.done, etc.) are lifecycle events — silently skip.
+                            default:
+                                break;
+                        }
+                    }
+                    catch {
+                        // Skip malformed SSE lines
+                    }
+                }
+            }
+        }
+        finally {
+            if (!streamDoneNaturally)
+                await cancelStreamAndCloseConnection(reader, res);
+        }
+    }
+}

@@ -697,6 +697,7 @@ app.post("/:chatId/edit-and-send", async (c) => {
   const content = (body as { content?: unknown }).content;
   const expectedVersion = (body as { expectedVersion?: unknown }).expectedVersion;
   const requestId = (body as { requestId?: unknown }).requestId;
+  const branchChat = (body as { branchChat?: unknown }).branchChat;
 
   if (typeof messageId !== "string" || !messageId.trim()) {
     return c.json({ error: "messageId is required" }, 400);
@@ -716,6 +717,7 @@ app.post("/:chatId/edit-and-send", async (c) => {
     content,
     expectedVersion,
     requestId,
+    ...(typeof branchChat === "boolean" ? { branchChat } : {}),
   });
   if (result.status === "not_found") return c.json({ error: result.error }, 404);
   if (result.status === "conflict") return c.json({ error: result.error }, 409);

@@ -230,14 +230,16 @@ export const createChatSlice: StateCreator<ChatSlice> = (set, get) => {
       }),
 
     reconcileMessagesTail: (page) =>
-      set((state) => ({
-        messages: sortMessagesByPosition(reconcileMessageTail(
-          state.messages,
-          state.totalChatLength,
-          page,
-        )),
-        totalChatLength: page.total,
-      })),
+      set((state) => {
+        return {
+          messages: sortMessagesByPosition(reconcileMessageTail(
+            state.messages,
+            state.totalChatLength,
+            page,
+          )),
+          totalChatLength: page.total,
+        }
+      }),
 
     prependMessages: (olderMessages) =>
       set((state) => {

@@ -1,0 +1,347 @@
+import { getDb } from "../db/connection";
+import { deleteImageIfUnreferenced, uploadImageDeferred } from "./images.service";
+import { getCharacter, updateCharacter } from "./characters.service";
+import { safeFetch } from "../utils/safe-fetch";
+import { eventBus } from "../ws/bus";
+import { EventType } from "../ws/events";
+import { createCanonicalGalleryImageReference, createGalleryImageReference, findCanonicalGalleryImageReference, findGalleryImageReference, parseCanonicalGalleryImageReference, parseGalleryImageReference, } from "../utils/gallery-image-reference";
+const GALLERY_REFERENCE_SEQUENCE_KEY = "gallery_reference_sequence";
+function rowToGalleryItem(row, assetMap) {
+    const reference = findCanonicalGalleryImageReference(assetMap, row.image_id)
+        ?? findGalleryImageReference(assetMap, row.image_id, row.id)
+        ?? createGalleryImageReference(row.id);
+    return {
+        id: row.id,
+        image_id: row.image_id,
+        reference,
+        caption: row.caption ?? "",
+        sort_order: row.sort_order ?? 0,
+        created_at: row.created_at,
+        width: row.width ?? null,
+        height: row.height ?? null,
+        mime_type: row.mime_type ?? "",
+    };
+}
+export function listGallery(userId, characterId) {
+    const rows = getDb()
+        .query(`SELECT g.id, g.image_id, g.caption, g.sort_order, g.created_at,
+              i.width, i.height, i.mime_type
+       FROM character_gallery g
+       JOIN images i ON i.id = g.image_id
+       WHERE g.user_id = ? AND g.character_id = ?
+       ORDER BY g.sort_order`)
+        .all(userId, characterId);
+    const assetMap = registerGalleryReferences(userId, characterId, rows);
+    return rows.map((row) => rowToGalleryItem(row, assetMap));
+}
+function replaceGalleryReferences(value, replacements) {
+    let next = value;
+    for (const [from, to] of replacements)
+        next = next.split(from).join(to);
+    return next;
+}
+function registerGalleryReferences(userId, characterId, items) {
+    if (items.length === 0)
+        return {};
+    const character = getCharacter(userId, characterId);
+    if (!character)
+        return {};
+    const current = character.extensions?.risu_asset_map;
+    const assetMap = current && typeof current === "object" && !Array.isArray(current)
+        ? { ...current }
+        : {};
+    let changed = false;
+    const storedSequence = Number.isSafeInteger(character.extensions?.[GALLERY_REFERENCE_SEQUENCE_KEY])
+        ? Math.max(0, character.extensions[GALLERY_REFERENCE_SEQUENCE_KEY])
+        : 0;
+    let sequence = storedSequence;
+    for (const reference of Object.keys(assetMap)) {
+        sequence = Math.max(sequence, parseCanonicalGalleryImageReference(reference) ?? 0);
+    }
+    if (sequence !== storedSequence)
+        changed = true;
+    const replacements = new Map();
+    for (const item of items) {
+        let reference = findCanonicalGalleryImageReference(assetMap, item.image_id);
+        if (!reference) {
+            reference = createCanonicalGalleryImageReference(++sequence);
+            assetMap[reference] = item.image_id;
+            changed = true;
+        }
+        const legacyReference = createGalleryImageReference(item.id);
+        if (legacyReference !== reference)
+            replacements.set(legacyReference, reference);
+    }
+    if (changed) {
+        const replace = (value) => replaceGalleryReferences(value, replacements);
+        const updates = {
+            extensions: {
+                ...(character.extensions || {}),
+                risu_asset_map: assetMap,
+                [GALLERY_REFERENCE_SEQUENCE_KEY]: sequence,
+            },
+        };
+        const textFields = [
+            "first_mes",
+            "description",
+            "personality",
+            "scenario",
+            "mes_example",
+            "system_prompt",
+            "post_history_instructions",
+            "creator_notes",
+        ];
+        for (const field of textFields) {
+            const currentValue = character[field] || "";
+            const nextValue = replace(currentValue);
+            if (nextValue !== currentValue)
+                updates[field] = nextValue;
+        }
+        const alternateGreetings = character.alternate_greetings || [];
+        const nextAlternateGreetings = alternateGreetings.map(replace);
+        if (nextAlternateGreetings.some((value, index) => value !== alternateGreetings[index])) {
+            updates.alternate_greetings = nextAlternateGreetings;
+        }
+        updateCharacter(userId, characterId, updates);
+    }
+    return assetMap;
+}
+export function addToGallery(userId, characterId, imageId, caption, options = {}) {
+    const id = crypto.randomUUID();
+    const now = Math.floor(Date.now() / 1000);
+    getDb()
+        .query(`INSERT INTO character_gallery (id, user_id, character_id, image_id, caption, sort_order, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`)
+        .run(id, userId, characterId, imageId, caption ?? "", 0, now);
+    if (options.registerReference !== false) {
+        registerGalleryReferences(userId, characterId, [{ id, image_id: imageId }]);
+    }
+    return getGalleryItem(userId, id);
+}
+/** Insert used by background flows (image-gen auto-link) that do not need the resulting row. */
+export function linkImageToGallery(userId, characterId, imageId, caption) {
+    const id = crypto.randomUUID();
+    const now = Math.floor(Date.now() / 1000);
+    getDb()
+        .query(`INSERT INTO character_gallery (id, user_id, character_id, image_id, caption, sort_order, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`)
+        .run(id, userId, characterId, imageId, caption ?? "", 0, now);
+    registerGalleryReferences(userId, characterId, [{ id, image_id: imageId }]);
+}
+export async function uploadToGallery(userId, characterId, file, caption, options = {}) {
+    const image = await uploadImageDeferred(userId, file, { owner_character_id: characterId });
+    return addToGallery(userId, characterId, image.id, caption, options);
+}
+/**
+ * Upload multiple images to a character's gallery in one call.
+ * Emits IMPORT_GALLERY_PROGRESS WS events so the frontend can track progress.
+ * Returns both successful items and any files that were skipped (oversized,
+ * runtime failure, etc.) so the caller can surface them to the user.
+ */
+export async function uploadBulkToGallery(userId, characterId, files, preSkipped = []) {
+    const total = files.length;
+    const items = [];
+    const skipped = [...preSkipped];
+    for (let i = 0; i < total; i++) {
+        eventBus.emit(EventType.IMPORT_GALLERY_PROGRESS, { characterId, current: i + 1, total, filename: files[i].name }, userId);
+        try {
+            const item = await uploadToGallery(userId, characterId, files[i], undefined, { registerReference: false });
+            items.push(item);
+        }
+        catch (err) {
+            skipped.push({
+                name: files[i].name || "unknown",
+                reason: err?.message ?? "upload failed",
+            });
+        }
+    }
+    const assetMap = registerGalleryReferences(userId, characterId, items);
+    for (const item of items) {
+        item.reference = findCanonicalGalleryImageReference(assetMap, item.image_id)
+            ?? item.reference;
+    }
+    return { items, skipped };
+}
+export function removeFromGallery(userId, itemId) {
+    const row = getDb()
+        .query("SELECT character_id, image_id FROM character_gallery WHERE id = ? AND user_id = ?")
+        .get(itemId, userId);
+    const item = getGalleryItem(userId, itemId);
+    if (!item || !row)
+        return false;
+    const result = getDb()
+        .query("DELETE FROM character_gallery WHERE id = ? AND user_id = ?")
+        .run(itemId, userId);
+    if (result.changes > 0) {
+        const stillInGallery = getDb()
+            .query("SELECT 1 AS found FROM character_gallery WHERE user_id = ? AND character_id = ? AND image_id = ? LIMIT 1")
+            .get(userId, row.character_id, row.image_id);
+        if (!stillInGallery) {
+            const character = getCharacter(userId, row.character_id);
+            const current = character?.extensions?.risu_asset_map;
+            if (character && current && typeof current === "object" && !Array.isArray(current)) {
+                const assetMap = Object.fromEntries(Object.entries(current).filter(([reference, imageId]) => imageId !== row.image_id || !parseGalleryImageReference(reference)));
+                if (Object.keys(assetMap).length !== Object.keys(current).length) {
+                    updateCharacter(userId, row.character_id, {
+                        extensions: { ...(character.extensions || {}), risu_asset_map: assetMap },
+                    });
+                }
+            }
+        }
+        deleteImageIfUnreferenced(userId, item.image_id);
+    }
+    return result.changes > 0;
+}
+export function updateCaption(userId, itemId, caption) {
+    const result = getDb()
+        .query("UPDATE character_gallery SET caption = ? WHERE id = ? AND user_id = ?")
+        .run(caption, itemId, userId);
+    if (result.changes === 0)
+        return null;
+    return getGalleryItem(userId, itemId);
+}
+function getGalleryItem(userId, itemId) {
+    const row = getDb()
+        .query(`SELECT g.id, g.image_id, g.caption, g.sort_order, g.created_at,
+              i.width, i.height, i.mime_type
+       FROM character_gallery g
+       JOIN images i ON i.id = g.image_id
+       WHERE g.id = ? AND g.user_id = ?`)
+        .get(itemId, userId);
+    if (!row)
+        return null;
+    const characterId = getDb()
+        .query("SELECT character_id FROM character_gallery WHERE id = ? AND user_id = ?")
+        .get(itemId, userId);
+    const assetMap = characterId
+        ? getCharacter(userId, characterId.character_id)?.extensions?.risu_asset_map
+        : undefined;
+    return rowToGalleryItem(row, assetMap);
+}
+// ── Image extraction from character data ──
+const MD_IMAGE_RE = /!\[[^\]]*\]\(([^)]+)\)/g;
+const HTML_IMG_RE = /<img[^>]+src=["']([^"']+)["']/gi;
+const BARE_URL_RE = /\bhttps?:\/\/[^\s<>"']+/gi;
+const IMAGE_PATH_RE = /\.(?:apng|avif|bmp|gif|heic|heif|ico|jpe?g|jfif|pjp|pjpeg|png|svg|webp)$/i;
+function trimTrailingUrlPunctuation(url) {
+    let trimmed = url.trim();
+    while (/[.,!?;:]$/.test(trimmed)) {
+        trimmed = trimmed.slice(0, -1);
+    }
+    while (trimmed.endsWith(")") && ((trimmed.match(/\(/g)?.length ?? 0) < (trimmed.match(/\)/g)?.length ?? 0))) {
+        trimmed = trimmed.slice(0, -1);
+    }
+    while (trimmed.endsWith("]") && ((trimmed.match(/\[/g)?.length ?? 0) < (trimmed.match(/\]/g)?.length ?? 0))) {
+        trimmed = trimmed.slice(0, -1);
+    }
+    return trimmed;
+}
+function isDirectImageUrl(url) {
+    try {
+        const parsed = new URL(url);
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+            return false;
+        return IMAGE_PATH_RE.test(parsed.pathname);
+    }
+    catch {
+        return false;
+    }
+}
+export function extractImageUrls(text) {
+    const seen = new Set();
+    const urls = [];
+    let m;
+    const push = (url) => {
+        if (!seen.has(url)) {
+            seen.add(url);
+            urls.push(url);
+        }
+    };
+    MD_IMAGE_RE.lastIndex = 0;
+    while ((m = MD_IMAGE_RE.exec(text)) !== null)
+        push(m[1]);
+    HTML_IMG_RE.lastIndex = 0;
+    while ((m = HTML_IMG_RE.exec(text)) !== null)
+        push(m[1]);
+    BARE_URL_RE.lastIndex = 0;
+    while ((m = BARE_URL_RE.exec(text)) !== null) {
+        const candidate = trimTrailingUrlPunctuation(m[0]);
+        if (isDirectImageUrl(candidate))
+            push(candidate);
+    }
+    return urls;
+}
+function dataUriToFile(dataUri) {
+    const [header, base64] = dataUri.split(",", 2);
+    const mime = header.match(/data:([^;]+)/)?.[1] || "image/png";
+    const ext = mime.split("/")[1]?.replace("+xml", "") || "png";
+    const buffer = Buffer.from(base64, "base64");
+    return new File([buffer], `extracted.${ext}`, { type: mime });
+}
+async function fetchUrlAsFile(url) {
+    const res = await safeFetch(url, { maxBytes: 50 * 1024 * 1024 });
+    if (!res.ok)
+        throw new Error(`Fetch failed: ${res.status}`);
+    const blob = await res.blob();
+    if (blob.type && !blob.type.startsWith("image/")) {
+        throw new Error(`Fetch did not return an image: ${blob.type}`);
+    }
+    const urlPath = new URL(url).pathname;
+    const ext = urlPath.split(".").pop()?.split("?")[0] || "png";
+    const name = `extracted.${ext}`;
+    return new File([blob], name, { type: blob.type || "image/png" });
+}
+export async function extractImagesFromCharacter(userId, characterId) {
+    const character = getCharacter(userId, characterId);
+    if (!character)
+        return [];
+    const textFields = [
+        character.first_mes,
+        character.description,
+        character.personality,
+        character.scenario,
+        character.mes_example,
+        character.system_prompt,
+        character.post_history_instructions,
+        character.creator_notes,
+        ...(character.alternate_greetings || []),
+    ];
+    if (character.extensions && Object.keys(character.extensions).length > 0) {
+        textFields.push(JSON.stringify(character.extensions));
+    }
+    const seen = new Set();
+    const urls = [];
+    for (const text of textFields) {
+        if (!text)
+            continue;
+        for (const url of extractImageUrls(text)) {
+            if (!seen.has(url)) {
+                seen.add(url);
+                urls.push(url);
+            }
+        }
+    }
+    if (urls.length === 0)
+        return [];
+    const items = [];
+    for (const url of urls) {
+        try {
+            let file;
+            if (url.startsWith("data:")) {
+                file = dataUriToFile(url);
+            }
+            else if (url.startsWith("http://") || url.startsWith("https://")) {
+                file = await fetchUrlAsFile(url);
+            }
+            else {
+                continue; // skip relative or unrecognised URLs
+            }
+            const item = await uploadToGallery(userId, characterId, file);
+            items.push(item);
+        }
+        catch {
+            // skip images that fail to download/convert
+        }
+    }
+    return items;
+}

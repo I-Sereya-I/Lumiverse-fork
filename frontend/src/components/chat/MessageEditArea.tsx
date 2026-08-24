@@ -87,7 +87,15 @@ function MessageEditAreaNative({
   const { t } = useTranslation('chat')
   const { t: tc } = useTranslation('common')
   const { t: ts } = useTranslation('shared', { keyPrefix: 'expandedTextEditor' })
-  const showEditAndSend = useStore((state) => readProductivityFlag(state, 'showEditAndSend'))
+  const showEditAndSend = useStore((state) => {
+    const extensions = (state as { extensions?: unknown[] }).extensions
+    const suiteEnabled = extensions === undefined || extensions.some((extension) => {
+      const candidate = extension as { identifier?: unknown; enabled?: unknown; has_frontend?: unknown }
+      return candidate.identifier === 'lumiverse_suite' && candidate.enabled === true && candidate.has_frontend === true
+    })
+    return suiteEnabled && readProductivityFlag(state, 'showEditAndSend')
+  })
+  const editAndSendSide = useStore((state) => state.quickToolbarSettings?.editAndSendSide ?? 'right')
   const hasReasoning = editReasoning != null && onChangeReasoning != null
   const contentRef = useRef<HTMLTextAreaElement>(null)
   const reasoningRef = useRef<HTMLTextAreaElement>(null)
@@ -261,6 +269,7 @@ function MessageEditAreaNative({
       </div>
       <div
         className={styles.editActions}
+        data-edit-and-send-side={editAndSendSide}
         data-spindle-mount="message_edit_actions"
         data-spindle-scope-key={messageId ? `message:${messageId}:edit-actions` : undefined}
       >
@@ -272,6 +281,7 @@ function MessageEditAreaNative({
           type="button"
           onClick={onEditAndSend}
           className={styles.editSaveBtn}
+          data-edit-and-send-action="true"
           aria-label={t('messageEdit.editAndSend', { defaultValue: 'Edit and Send' })}
           disabled={editAndSendDisabled || !editContent.trim()}
         >

@@ -1,0 +1,110 @@
+import { warnBunWorkerFallback, shouldUseBunWorkers } from "../../utils/bun-worker-guard";
+import { runHeuristicAnalysis } from "./heuristic-analysis";
+class HeuristicWorkerHost {
+    worker = null;
+    pending = new Map();
+    ensureWorker() {
+        if (this.worker)
+            return this.worker;
+        const worker = new Worker(new URL("./heuristic-worker.ts", import.meta.url).href, {
+            type: "module",
+        });
+        worker.onmessage = (event) => {
+            const msg = event.data;
+            if (!msg)
+                return;
+            const pending = this.pending.get(msg.requestId);
+            if (!pending)
+                return;
+            this.pending.delete(msg.requestId);
+            if (msg.type === "result")
+                pending.resolve(msg.result);
+            else
+                pending.reject(new Error(msg.error));
+        };
+        worker.onerror = (event) => {
+            const error = event instanceof ErrorEvent
+                ? event.error ?? new Error(event.message)
+                : new Error("Heuristic worker crashed");
+            this.failAll(error);
+            this.worker = null;
+            try {
+                worker.terminate();
+            }
+            catch { /* noop */ }
+        };
+        this.worker = worker;
+        return worker;
+    }
+    failAll(error) {
+        for (const [, pending] of this.pending) {
+            pending.reject(error);
+        }
+        this.pending.clear();
+    }
+    releaseIfIdle() {
+        if (!this.worker || this.pending.size > 0)
+            return false;
+        const worker = this.worker;
+        this.worker = null;
+        worker.onmessage = null;
+        worker.onerror = null;
+        worker.terminate();
+        return true;
+    }
+    run(payload) {
+        if (!shouldUseBunWorkers()) {
+            warnBunWorkerFallback("memory-cortex heuristics");
+            return Promise.resolve(runHeuristicAnalysis(payload));
+        }
+        const requestId = crypto.randomUUID();
+        const worker = this.ensureWorker();
+        const request = { type: "run", requestId, payload };
+        return new Promise((resolve, reject) => {
+            this.pending.set(requestId, { resolve, reject });
+            worker.postMessage(request);
+        });
+    }
+}
+/**
+ * Round-robin pool of heuristic worker hosts.
+ *
+ * The previous implementation used a single shared worker. For workloads that
+ * fire concurrent heuristic requests (notably arbiter-mode rebuilds, where
+ * Promise.all queues 5+ chunks per batch and ~3 batches run concurrently),
+ * everything serialized inside that one worker — turning N parallel requests
+ * into N sequential ones.
+ *
+ * Each pool host owns its own worker, created lazily on first use. Hosts that
+ * are never used cost nothing. Round-robin distribution keeps utilization even
+ * without needing a real work-stealing queue.
+ */
+const HEURISTIC_WORKER_POOL_SIZE = 4;
+class HeuristicWorkerPool {
+    hosts;
+    nextIdx = 0;
+    constructor(size) {
+        const count = Math.max(1, Math.floor(size));
+        this.hosts = Array.from({ length: count }, () => new HeuristicWorkerHost());
+    }
+    run(payload) {
+        const host = this.hosts[this.nextIdx];
+        this.nextIdx = (this.nextIdx + 1) % this.hosts.length;
+        return host.run(payload);
+    }
+    releaseIdle() {
+        let released = 0;
+        for (const host of this.hosts) {
+            if (host.releaseIfIdle())
+                released++;
+        }
+        return released;
+    }
+}
+const pool = new HeuristicWorkerPool(HEURISTIC_WORKER_POOL_SIZE);
+export function runHeuristicAnalysisInWorker(payload) {
+    return pool.run(payload);
+}
+export function releaseIdleHeuristicWorkers() {
+    return pool.releaseIdle();
+}

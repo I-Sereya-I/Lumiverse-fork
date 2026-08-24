@@ -404,8 +404,8 @@
 
 /* A retained host may remain mounted while its canonical workspace is empty
    during a placement transition. It must not paint a blank top-dock rail when floating. */
-.chatToolbar[data-dock-request='floating']:not(:has(> button:not([hidden]), > [data-component='QuickToolbar'])):not([data-spindle-occupied]),
-.chatToolbar:not([data-dock-request]):not(:has(> button:not([hidden]), > [data-component='QuickToolbar'])):not([data-spindle-occupied]) {
+.chatToolbar[data-dock-request='floating']:not(:has(> button:not([hidden]), > .nativeDockActions > button:not([hidden]), > [data-component='QuickToolbar'])):not([data-spindle-occupied]),
+.chatToolbar:not([data-dock-request]):not(:has(> button:not([hidden]), > .nativeDockActions > button:not([hidden]), > [data-component='QuickToolbar'])):not([data-spindle-occupied]) {
   display: contents;
   min-height: 0;
   padding: 0;
@@ -510,6 +510,21 @@
   cursor: pointer;
   transition: all var(--lumiverse-transition-fast, 120ms);
   opacity: 0.6;
+}
+
+.nativeDockActions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.chatToolbar[data-native-action-side='left'] .nativeDockActions { order: 1; margin-inline-start: 0; }
+.chatToolbar[data-native-action-side='left'] > :global([data-component='QuickToolbar']) { order: 2; }
+.chatToolbar[data-native-action-side='right'] > :global([data-component='QuickToolbar']) { order: 1; }
+.chatToolbar[data-native-action-side='right'] .nativeDockActions {
+  order: 2;
+  margin-inline-start: auto;
 }
 
 .toolbarBtnPrimary {

@@ -1,0 +1,512 @@
+import { EventType, } from "./events";
+const CLIENT_SWEEP_INTERVAL_MS = 60_000;
+const CLIENT_TIMEOUT_MS = 120_000;
+// A suspended PWA cannot reliably run JavaScript heartbeats. Bun's native
+// WebSocket keepalive still detects a broken transport, while this longer lease
+// prevents our application-level sweep from evicting a client merely because it
+// was backgrounded. The entry is still removed immediately on a real close.
+const HIDDEN_CLIENT_TIMEOUT_MS = 30 * 60_000;
+function getUserTopic(userId) {
+    return `user:${userId}`;
+}
+function getStreamTopic(userId, chatId) {
+    return `stream:${userId}:${chatId}`;
+}
+function getRoomTopic(roomId) {
+    return `room:${roomId}`;
+}
+// The "feed" topic carries the re-broadcast chat/generation events
+// (MESSAGE_SENT / STREAM_TOKEN_RECEIVED / GENERATION_*). ONLY peers subscribe
+// to it — the host already receives those on its own user topic (it owns the
+// chat), so subscribing the host here too would double-deliver every token.
+function getRoomFeedTopic(roomId) {
+    return `room:${roomId}:feed`;
+}
+class EventBus {
+    server = null;
+    clientToUser = new Map();
+    sessionToClient = new Map();
+    clientToSession = new Map();
+    clientToFocusedChat = new Map();
+    clientLastActivity = new Map();
+    clientVisibility = new Map();
+    // ── Multiplayer rooms ──
+    // A socket may subscribe to one or more room topics. Peer (room-token)
+    // sockets are tracked HERE but NOT in clientToUser — they never receive
+    // user:/system events, only their room:{roomId} topic.
+    clientToRooms = new Map();
+    participantToClient = new Map();
+    clientToParticipants = new Map();
+    // In-process sinks for ALL room broadcasts (lifecycle + feed). The relay
+    // bridge subscribes here to mirror a room's full event stream to off-instance
+    // peers, since publishToRoom/Feed deliver only to local WS topic subscribers.
+    roomBroadcastListeners = new Set();
+    listeners = new Map();
+    pendingListenerDispatches = [];
+    listenerDispatchTimer = null;
+    bufferedEvents = null;
+    /** Per-user visibility: true if at least one session reports visible. */
+    userVisibility = new Map();
+    userAllHiddenSince = new Map();
+    sweepTimer = null;
+    /** Store the Bun server reference so we can use native publish(). */
+    setServer(server) {
+        this.server = server;
+    }
+    withBufferedEvents(callback) {
+        const parent = this.bufferedEvents;
+        const buffer = parent ?? [];
+        this.bufferedEvents = buffer;
+        try {
+            const value = callback();
+            return { value, events: parent ? [] : buffer.slice() };
+        }
+        catch (error) {
+            if (!parent)
+                buffer.length = 0;
+            throw error;
+        }
+        finally {
+            this.bufferedEvents = parent;
+        }
+    }
+    addClient(ws, userId, sessionId) {
+        // If the socket already closed during onOpen's async auth/DB work, don't
+        // register it. onClose would have run removeClient as a no-op (not yet in
+        // the maps), so inserting a dead socket here would leave tracking that only
+        // the 120s sweep reclaims. readyState 1 === OPEN on Bun's ServerWebSocket.
+        if (ws.readyState !== 1)
+            return;
+        // Track session → socket mapping for dedup, but do NOT forcefully evict
+        // the old socket. Stale sockets are cleaned up naturally via onClose →
+        // removeClient. Forceful eviction causes reconnect loops because the
+        // close frame triggers the client to reconnect, which evicts again, etc.
+        if (sessionId) {
+            const existing = this.sessionToClient.get(sessionId);
+            if (existing && existing !== ws) {
+                // Just remove tracking — the old socket's onClose will fire and
+                // call removeClient() to clean up subscriptions.
+                this.removeClient(existing);
+            }
+            this.sessionToClient.set(sessionId, ws);
+            this.clientToSession.set(ws, sessionId);
+        }
+        this.clientToUser.set(ws, userId);
+        this.clientLastActivity.set(ws, Date.now());
+        this.clientVisibility.set(ws, true);
+        // Subscribe to per-user topic and system broadcast topic.
+        // Bun's native pub/sub handles delivery in Zig — no JS iteration needed.
+        try {
+            ws.subscribe(getUserTopic(userId));
+            ws.subscribe("system");
+        }
+        catch {
+            // Socket may already be closed
+        }
+        this.startSweep();
+    }
+    removeClient(ws) {
+        const userId = this.clientToUser.get(ws);
+        const sessionId = this.clientToSession.get(ws);
+        const focusedChatId = this.clientToFocusedChat.get(ws);
+        if (userId) {
+            try {
+                ws.unsubscribe(getUserTopic(userId));
+                ws.unsubscribe("system");
+                if (focusedChatId) {
+                    ws.unsubscribe(getStreamTopic(userId, focusedChatId));
+                }
+            }
+            catch {
+                // Socket may already be closed
+            }
+            this.clientToUser.delete(ws);
+            this.clientToFocusedChat.delete(ws);
+            this.clientLastActivity.delete(ws);
+            if (sessionId)
+                this.removeSessionVisibility(userId, sessionId);
+        }
+        if (sessionId) {
+            // Only remove from session map if this socket is still the current one
+            if (this.sessionToClient.get(sessionId) === ws) {
+                this.sessionToClient.delete(sessionId);
+            }
+            this.clientToSession.delete(ws);
+        }
+        // Multiplayer room cleanup (runs for peer sockets that have no userId too).
+        const rooms = this.clientToRooms.get(ws);
+        if (rooms) {
+            for (const roomId of rooms) {
+                try {
+                    ws.unsubscribe(getRoomTopic(roomId));
+                    ws.unsubscribe(getRoomFeedTopic(roomId));
+                }
+                catch {
+                    // Socket may already be closed
+                }
+            }
+            this.clientToRooms.delete(ws);
+        }
+        const participants = this.clientToParticipants.get(ws);
+        if (participants) {
+            for (const pid of participants) {
+                if (this.participantToClient.get(pid) === ws) {
+                    this.participantToClient.delete(pid);
+                }
+            }
+            this.clientToParticipants.delete(ws);
+        }
+        // Peer-only sockets are tracked for the sweep but never had a userId, so
+        // the userId block above won't have cleared their activity entry.
+        if (!userId)
+            this.clientLastActivity.delete(ws);
+        this.clientVisibility.delete(ws);
+    }
+    /** Refresh activity timestamp for a known socket. Called on any message. */
+    touchClient(ws) {
+        if (this.clientToUser.has(ws) || this.clientToRooms.has(ws)) {
+            this.clientLastActivity.set(ws, Date.now());
+        }
+    }
+    /** Route stream tokens only to the session actively viewing a chat. */
+    setClientStreamFocus(ws, userId, chatId) {
+        if (this.clientToUser.get(ws) !== userId)
+            return;
+        const previousChatId = this.clientToFocusedChat.get(ws);
+        if (previousChatId === chatId)
+            return;
+        try {
+            if (previousChatId) {
+                ws.unsubscribe(getStreamTopic(userId, previousChatId));
+                this.clientToFocusedChat.delete(ws);
+            }
+            if (chatId) {
+                ws.subscribe(getStreamTopic(userId, chatId));
+                this.clientToFocusedChat.set(ws, chatId);
+            }
+        }
+        catch {
+            // Socket may already be closed
+        }
+    }
+    // ─── Multiplayer rooms ─────────────────────────────────────────────────
+    /**
+     * Attach a socket to a room. For peer (room-token) sockets this is the ONLY
+     * subscription they get — they never see user:/system topics. The socket is
+     * registered in the activity sweep so idle peer connections are reclaimed.
+     */
+    subscribeClientToRoom(ws, roomId, participantId, opts) {
+        try {
+            ws.subscribe(getRoomTopic(roomId));
+            // Peers also subscribe to the feed topic (re-broadcast chat/gen events).
+            // The host does NOT — it gets those on its user topic already.
+            if (opts?.feed)
+                ws.subscribe(getRoomFeedTopic(roomId));
+        }
+        catch {
+            // Socket may already be closed
+        }
+        let rooms = this.clientToRooms.get(ws);
+        if (!rooms) {
+            rooms = new Set();
+            this.clientToRooms.set(ws, rooms);
+        }
+        rooms.add(roomId);
+        let participants = this.clientToParticipants.get(ws);
+        if (!participants) {
+            participants = new Set();
+            this.clientToParticipants.set(ws, participants);
+        }
+        participants.add(participantId);
+        this.participantToClient.set(participantId, ws);
+        this.clientLastActivity.set(ws, Date.now());
+        this.startSweep();
+    }
+    unsubscribeClientFromRoom(ws, roomId, participantId) {
+        try {
+            ws.unsubscribe(getRoomTopic(roomId));
+            ws.unsubscribe(getRoomFeedTopic(roomId));
+        }
+        catch {
+            // Socket may already be closed
+        }
+        this.clientToRooms.get(ws)?.delete(roomId);
+        this.clientToParticipants.get(ws)?.delete(participantId);
+        if (this.participantToClient.get(participantId) === ws) {
+            this.participantToClient.delete(participantId);
+        }
+    }
+    /**
+     * Publish an event ONLY to a room topic. Unlike `emit`, this does NOT fire
+     * in-process listeners — so the multiplayer fan-out (which re-broadcasts
+     * MESSAGE_SENT / STREAM_TOKEN_RECEIVED / GENERATION_* into a room) cannot
+     * recurse back into its own listener.
+     */
+    /** Subscribe to every room broadcast (lifecycle + feed). For the relay bridge. */
+    onRoomBroadcast(fn) {
+        this.roomBroadcastListeners.add(fn);
+        return () => this.roomBroadcastListeners.delete(fn);
+    }
+    fireRoomBroadcast(roomId, event, payload) {
+        for (const fn of this.roomBroadcastListeners) {
+            try {
+                fn(roomId, event, payload);
+            }
+            catch (err) {
+                console.error("[bus] roomBroadcast listener error:", err);
+            }
+        }
+    }
+    publishToRoom(roomId, event, payload = {}) {
+        if (this.server) {
+            const message = { event, payload, timestamp: Date.now() };
+            this.server.publish(getRoomTopic(roomId), JSON.stringify(message));
+        }
+        this.fireRoomBroadcast(roomId, event, payload);
+    }
+    /**
+     * Publish to the room FEED topic (peers only) — used by the fan-out to
+     * re-broadcast chat/generation events without double-delivering to the host.
+     */
+    publishToRoomFeed(roomId, event, payload = {}) {
+        if (this.server) {
+            const message = { event, payload, timestamp: Date.now() };
+            this.server.publish(getRoomFeedTopic(roomId), JSON.stringify(message));
+        }
+        this.fireRoomBroadcast(roomId, event, payload);
+    }
+    /** Force-close a specific participant's socket (kick / ban / room close). */
+    disconnectParticipant(participantId, code = 1000, reason = "") {
+        const ws = this.participantToClient.get(participantId);
+        if (!ws)
+            return;
+        try {
+            ws.close(code, reason);
+        }
+        catch {
+            // Already closed
+        }
+    }
+    isParticipantConnected(participantId) {
+        return this.participantToClient.has(participantId);
+    }
+    // ─── Sweep ───────────────────────────────────────────────────────────
+    startSweep() {
+        if (this.sweepTimer)
+            return;
+        this.sweepTimer = setInterval(() => this.sweep(), CLIENT_SWEEP_INTERVAL_MS);
+        if (typeof this.sweepTimer.unref === "function") {
+            this.sweepTimer.unref();
+        }
+    }
+    stopSweep() {
+        if (this.sweepTimer) {
+            clearInterval(this.sweepTimer);
+            this.sweepTimer = null;
+        }
+    }
+    sweep() {
+        const now = Date.now();
+        let closed = 0;
+        for (const [ws, lastActivity] of this.clientLastActivity) {
+            const timeoutMs = this.clientVisibility.get(ws) === false
+                ? HIDDEN_CLIENT_TIMEOUT_MS
+                : CLIENT_TIMEOUT_MS;
+            if (now - lastActivity > timeoutMs) {
+                try {
+                    ws.close(1001, "Timeout");
+                }
+                catch {
+                    // Already closed; remove tracking below
+                }
+                this.removeClient(ws);
+                closed++;
+            }
+        }
+        if (closed > 0) {
+            console.log(`[WS] Sweep closed ${closed} stale client(s) (timeout ${CLIENT_TIMEOUT_MS}ms)`);
+        }
+    }
+    on(event, listener) {
+        if (!this.listeners.has(event)) {
+            this.listeners.set(event, new Set());
+        }
+        this.listeners.get(event).add(listener);
+        return () => this.listeners.get(event)?.delete(listener);
+    }
+    flushListenerDispatches() {
+        this.listenerDispatchTimer = null;
+        const pending = this.pendingListenerDispatches.splice(0, this.pendingListenerDispatches.length);
+        for (const run of pending)
+            run();
+        if (this.pendingListenerDispatches.length > 0) {
+            this.listenerDispatchTimer = setTimeout(() => this.flushListenerDispatches(), 0);
+        }
+    }
+    scheduleListenerDispatch(task) {
+        this.pendingListenerDispatches.push(task);
+        if (this.listenerDispatchTimer)
+            return;
+        this.listenerDispatchTimer = setTimeout(() => this.flushListenerDispatches(), 0);
+    }
+    emit(event, payload = {}, userId, options) {
+        if (this.bufferedEvents) {
+            this.bufferedEvents.push({ event, payload, userId, options });
+            return;
+        }
+        const message = {
+            event,
+            payload,
+            timestamp: Date.now(),
+            userId,
+        };
+        const json = JSON.stringify(message);
+        // Use Bun's native pub/sub for WebSocket delivery — single native call
+        // instead of iterating over JS Maps and calling ws.send() per-socket.
+        if (this.server) {
+            const topic = options?.topic || (userId ? getUserTopic(userId) : "system");
+            this.server.publish(topic, json);
+        }
+        // Fire in-process listeners asynchronously so extension worker IPC
+        // doesn't block the streaming hot path.
+        const eventListeners = this.listeners.get(event);
+        if (eventListeners) {
+            for (const listener of eventListeners) {
+                this.scheduleListenerDispatch(() => {
+                    try {
+                        listener(message);
+                    }
+                    catch (err) {
+                        console.error(`Event listener error for ${event}:`, err);
+                    }
+                });
+            }
+        }
+    }
+    // ─── User Visibility ─────────────────────────────────────────────────
+    /**
+     * Record a visibility state change for a user session.
+     * Called when the frontend sends a "visibility" message over the WebSocket.
+     */
+    setUserVisibility(userId, sessionId, visible) {
+        if (!this.userVisibility.has(userId)) {
+            this.userVisibility.set(userId, new Map());
+        }
+        this.userVisibility.get(userId).set(sessionId, visible);
+        const client = this.sessionToClient.get(sessionId);
+        if (client)
+            this.clientVisibility.set(client, visible);
+        this.updateUserVisibilityState(userId);
+    }
+    /**
+     * Remove a session's visibility entry.
+     * Called when a WebSocket disconnects.
+     */
+    removeSessionVisibility(userId, sessionId) {
+        const sessions = this.userVisibility.get(userId);
+        if (!sessions) {
+            this.userAllHiddenSince.set(userId, Date.now());
+            return;
+        }
+        sessions.delete(sessionId);
+        if (sessions.size === 0)
+            this.userVisibility.delete(userId);
+        this.updateUserVisibilityState(userId);
+    }
+    /**
+     * Returns true if the user has at least one session with the app visible/focused.
+     * Returns false if no sessions are connected or all sessions report hidden.
+     */
+    isUserVisible(userId) {
+        const sessions = this.userVisibility.get(userId);
+        if (!sessions || sessions.size === 0)
+            return false;
+        for (const visible of sessions.values()) {
+            if (visible)
+                return true;
+        }
+        return false;
+    }
+    getUserVisibilitySnapshot(userId) {
+        const sessions = this.userVisibility.get(userId);
+        const totalSessions = sessions?.size ?? 0;
+        let visibleSessions = 0;
+        if (sessions) {
+            for (const visible of sessions.values()) {
+                if (visible)
+                    visibleSessions++;
+            }
+        }
+        // No write here — `allHiddenSince` is set by updateUserVisibilityState
+        // whenever a session transitions to hidden. Reading the snapshot used to
+        // also stamp the timer, which mixed observation and mutation in the same
+        // call and left subtle behavior depending on who polled first.
+        let allHiddenSince = null;
+        if (visibleSessions === 0) {
+            allHiddenSince = this.userAllHiddenSince.get(userId) ?? null;
+        }
+        return {
+            totalSessions,
+            visibleSessions,
+            hiddenSessions: Math.max(totalSessions - visibleSessions, 0),
+            isVisible: visibleSessions > 0,
+            allHiddenSince,
+        };
+    }
+    updateUserVisibilityState(userId) {
+        if (this.isUserVisible(userId)) {
+            this.userAllHiddenSince.delete(userId);
+            return;
+        }
+        if (!this.userAllHiddenSince.has(userId)) {
+            this.userAllHiddenSince.set(userId, Date.now());
+        }
+    }
+    get clientCount() {
+        return this.clientToUser.size;
+    }
+    /** Returns the set of unique user IDs with at least one active WS connection. */
+    getConnectedUserIds() {
+        return [...new Set(this.clientToUser.values())];
+    }
+}
+export const eventBus = new EventBus();
+function isScopedProviderRecipient(userId, scope) {
+    return typeof userId === "string" && userId.trim().length > 0
+        && typeof scope === "string" && scope.trim().length > 0;
+}
+function emitScopedProviderRegistryEvent(action, args) {
+    if (!isScopedProviderRecipient(args.userId, args.scope))
+        return;
+    if (!Number.isFinite(args.generation) || !Number.isFinite(args.revision))
+        return;
+    const userId = args.userId.trim();
+    const payload = {
+        userId,
+        scope: args.scope.trim(),
+        action,
+        generation: args.generation,
+        revision: args.revision,
+        payload: args.payload,
+    };
+    // Explicit user topic — never the implicit system fallback in emit().
+    eventBus.emit(EventType.SPINDLE_PROVIDER_CHANGED, payload, userId, {
+        topic: getUserTopic(userId),
+    });
+}
+/**
+ * Lane 3 registry hook. Recipient-scoped to `user:${userId}`.
+ * Never broadcasts provider registration changes on the system topic.
+ */
+export function emitProviderRegistryChanged(args) {
+    if (args.action !== "add" && args.action !== "remove" && args.action !== "change")
+        return;
+    emitScopedProviderRegistryEvent(args.action, args);
+}
+/**
+ * Lane 3 snapshot hook for reconnect resync. Same recipient scoping as
+ * {@link emitProviderRegistryChanged}.
+ */
+export function emitProviderRegistrySnapshot(args) {
+    emitScopedProviderRegistryEvent("snapshot", args);
+}

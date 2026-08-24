@@ -1166,7 +1166,7 @@ export function useDisplayRegex(
   const staleMatchesMessage = !!stale && stale.messageId === resolvedMessageId
   const staleResolved = staleMatchesMessage && (stale.content === content || RAW_MACRO_RE.test(fallbackContent))
     ? stale.value
-    : staleMatchesMessage && isStreaming && liveResolved === undefined && contentCacheKey !== null
+    : staleMatchesMessage && isStreaming && liveResolved === undefined && displayScripts.length > 0
       ? stale.value
       : undefined
 

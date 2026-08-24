@@ -1,0 +1,561 @@
+import { COMMON_PARAMS } from "../param-schema";
+import { cancelStreamAndCloseConnection, createCooperativeYielder, fetchWithPreflightAbort, readJsonWithAbort, readWithAbort } from "../stream-utils";
+import { getTextContent } from "../types";
+import { fetchProviderJson, throwProviderResponseError } from "../../utils/provider-errors";
+import { sanitizeGeminiSchema } from "./google";
+import { appendGoogleSearchTool, buildGoogleSearchTool, GOOGLE_SEARCH_HANDLED_PARAMS, GOOGLE_SEARCH_PARAMETERS, } from "./google-search";
+const TOKEN_SCOPE = "https://www.googleapis.com/auth/cloud-platform";
+const TOKEN_REFRESH_MARGIN = 300; // refresh 5 min before expiry
+/** Per-connection token cache keyed by client_email. */
+const tokenCache = new Map();
+/**
+ * Cap on cached tokens. Long-running deployments that rotate through many
+ * service accounts (e.g. a multi-tenant Vertex setup) used to grow this map
+ * without bound. We evict the oldest entry by insertion order when the cap
+ * is hit, and a periodic sweep drops entries that have already expired so
+ * idle accounts don't squat on cache slots.
+ */
+const TOKEN_CACHE_MAX = 256;
+const TOKEN_CACHE_SWEEP_MS = 5 * 60 * 1000;
+let _vertexSweepTimer = null;
+function ensureVertexCacheSweep() {
+    if (_vertexSweepTimer)
+        return;
+    _vertexSweepTimer = setInterval(() => {
+        const now = Math.floor(Date.now() / 1000);
+        for (const [key, entry] of tokenCache) {
+            if (entry.expiresAt <= now)
+                tokenCache.delete(key);
+        }
+    }, TOKEN_CACHE_SWEEP_MS);
+    if (typeof _vertexSweepTimer.unref === "function") {
+        _vertexSweepTimer.unref();
+    }
+}
+export function stopVertexTokenSweep() {
+    if (_vertexSweepTimer) {
+        clearInterval(_vertexSweepTimer);
+        _vertexSweepTimer = null;
+    }
+}
+function base64urlEncode(input) {
+    const bytes = typeof input === "string"
+        ? new TextEncoder().encode(input)
+        : new Uint8Array(input);
+    let binary = "";
+    for (let i = 0; i < bytes.length; i++)
+        binary += String.fromCharCode(bytes[i]);
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+async function importPKCS8Key(pem) {
+    const pemBody = pem
+        .replace(/-----BEGIN PRIVATE KEY-----/g, "")
+        .replace(/-----END PRIVATE KEY-----/g, "")
+        .replace(/\s/g, "");
+    const binaryDer = Uint8Array.from(atob(pemBody), (c) => c.charCodeAt(0));
+    return crypto.subtle.importKey("pkcs8", binaryDer, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
+}
+async function createSignedJwt(sa) {
+    const now = Math.floor(Date.now() / 1000);
+    const header = { alg: "RS256", typ: "JWT", kid: sa.private_key_id };
+    const payload = {
+        iss: sa.client_email,
+        scope: TOKEN_SCOPE,
+        aud: sa.token_uri || "https://oauth2.googleapis.com/token",
+        iat: now,
+        exp: now + 3600,
+    };
+    const encodedHeader = base64urlEncode(JSON.stringify(header));
+    const encodedPayload = base64urlEncode(JSON.stringify(payload));
+    const signingInput = `${encodedHeader}.${encodedPayload}`;
+    const key = await importPKCS8Key(sa.private_key);
+    const signature = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, new TextEncoder().encode(signingInput));
+    return `${signingInput}.${base64urlEncode(signature)}`;
+}
+export async function getAccessToken(sa) {
+    ensureVertexCacheSweep();
+    const now = Math.floor(Date.now() / 1000);
+    const cached = tokenCache.get(sa.client_email);
+    if (cached && now < cached.expiresAt - TOKEN_REFRESH_MARGIN) {
+        return cached.accessToken;
+    }
+    const jwt = await createSignedJwt(sa);
+    const tokenUri = sa.token_uri || "https://oauth2.googleapis.com/token";
+    const res = await fetch(tokenUri, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: `grant_type=${encodeURIComponent("urn:ietf:params:oauth:grant-type:jwt-bearer")}&assertion=${jwt}`,
+    });
+    if (!res.ok) {
+        await throwProviderResponseError("Vertex AI", "authentication", res);
+    }
+    const data = (await res.json());
+    const token = {
+        accessToken: data.access_token,
+        expiresAt: now + data.expires_in,
+    };
+    // FIFO eviction once we hit the cap. We refresh the entry below so a
+    // currently-active service account never gets evicted in favor of a colder
+    // one (we delete then re-set, which moves to the back of insertion order).
+    if (tokenCache.size >= TOKEN_CACHE_MAX && !tokenCache.has(sa.client_email)) {
+        const oldest = tokenCache.keys().next();
+        if (!oldest.done)
+            tokenCache.delete(oldest.value);
+    }
+    tokenCache.delete(sa.client_email);
+    tokenCache.set(sa.client_email, token);
+    return token.accessToken;
+}
+/** Parse the service account JSON stored as the "API key" secret. */
+export function parseServiceAccount(apiKey) {
+    try {
+        const sa = JSON.parse(apiKey);
+        if (!sa.private_key || !sa.client_email || !sa.project_id) {
+            throw new Error("Missing required fields (private_key, client_email, project_id)");
+        }
+        return sa;
+    }
+    catch (e) {
+        throw new Error(`Invalid service account JSON: ${e.message}`);
+    }
+}
+/**
+ * Resolve the API hostname for a given Vertex AI location.
+ *
+ * Per Google's @google/genai SDK (`_api_client.ts`):
+ *   - `global`  → `https://aiplatform.googleapis.com/` (un-prefixed)
+ *   - regional  → `https://{location}-aiplatform.googleapis.com/`
+ *
+ * There is no `global-aiplatform.googleapis.com` host — that was an
+ * incorrect guess. All Vertex operations (generate, stream, list publishers)
+ * use the same host pattern.
+ */
+export function vertexHostForLocation(location) {
+    if (!location || location === "global")
+        return "https://aiplatform.googleapis.com";
+    return `https://${location}-aiplatform.googleapis.com`;
+}
+/**
+ * List Vertex AI locations available to the service account's project.
+ * Uses the global endpoint since the caller doesn't have a region yet.
+ */
+export async function listVertexLocations(apiKey) {
+    const sa = parseServiceAccount(apiKey);
+    const accessToken = await getAccessToken(sa);
+    const allLocations = [];
+    let pageToken;
+    do {
+        const params = new URLSearchParams();
+        if (pageToken)
+            params.set("pageToken", pageToken);
+        const url = `https://aiplatform.googleapis.com/v1/projects/${sa.project_id}/locations${params.toString() ? `?${params}` : ""}`;
+        const data = await fetchProviderJson("Vertex AI", "region listing", url, {
+            headers: { Authorization: `Bearer ${accessToken}` },
+        });
+        const locations = data.locations || [];
+        for (const loc of locations) {
+            const id = loc.locationId || loc.name?.split("/").pop() || "";
+            if (id)
+                allLocations.push(id);
+        }
+        pageToken = data.nextPageToken;
+    } while (pageToken);
+    return allLocations.sort();
+}
+// ── Provider implementation ────────────────────────────────────────────────
+export class GoogleVertexProvider {
+    name = "google_vertex";
+    displayName = "Google Vertex AI";
+    defaultUrl = "https://aiplatform.googleapis.com";
+    capabilities = {
+        parameters: {
+            temperature: { ...COMMON_PARAMS.temperature, max: 2 },
+            max_tokens: COMMON_PARAMS.max_tokens,
+            top_p: COMMON_PARAMS.top_p,
+            top_k: COMMON_PARAMS.top_k,
+            stop: COMMON_PARAMS.stop,
+            ...GOOGLE_SEARCH_PARAMETERS,
+        },
+        requiresMaxTokens: false,
+        supportsSystemRole: true,
+        supportsStreaming: true,
+        apiKeyRequired: true, // We use the "API key" slot to store the service account JSON
+        modelListStyle: "none", // Vertex model list requires project/location — handled in listModels()
+        // Same as Gemini API: reasoning is preserved across tool calls via the
+        // opaque `thoughtSignature` on each functionCall part, captured onto
+        // ToolCallResult.thought_signature and re-emitted by formatParts.
+        interleavedThinking: true,
+    };
+    /** Build the Vertex AI base URL for model operations (generate, stream, etc.). */
+    endpointBase(projectId, location) {
+        const host = vertexHostForLocation(location);
+        return `${host}/v1/projects/${projectId}/locations/${location}/publishers/google/models`;
+    }
+    /** Strip resource-name prefixes so only the bare model ID hits the URL path. */
+    sanitizeModelId(model) {
+        return model
+            .replace(/^publishers\/google\/models\//, "")
+            .replace(/^projects\/[^/]+\/locations\/[^/]+\/publishers\/google\/models\//, "")
+            .replace(/^models\//, "");
+    }
+    /** Extract project_id and location from the resolved API URL. */
+    resolveProjectConfig(apiKey, apiUrl) {
+        const sa = parseServiceAccount(apiKey);
+        // Location is encoded in the URL by resolveEffectiveApiUrl (from metadata.vertex_region).
+        // Regional: https://{location}-aiplatform.googleapis.com  →  extract location
+        // Global:   https://aiplatform.googleapis.com             →  "global" (default)
+        let location = "global";
+        const parsedUrl = apiUrl || this.defaultUrl;
+        const regionalMatch = parsedUrl.match(/^https?:\/\/([a-z0-9-]+)-aiplatform\.googleapis\.com/);
+        if (regionalMatch) {
+            location = regionalMatch[1];
+        }
+        return { sa, projectId: sa.project_id, location };
+    }
+    async generate(apiKey, apiUrl, request) {
+        const { sa, projectId, location } = this.resolveProjectConfig(apiKey, apiUrl);
+        const accessToken = await getAccessToken(sa);
+        const base = this.endpointBase(projectId, location);
+        const model = this.sanitizeModelId(request.model);
+        const url = `${base}/${model}:generateContent`;
+        const body = this.buildBody(request);
+        const res = await fetchWithPreflightAbort(url, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${accessToken}`,
+            },
+            body: JSON.stringify(body),
+        }, request.signal);
+        if (!res.ok)
+            await throwProviderResponseError("Vertex AI", "generate", res);
+        const data = (await readJsonWithAbort(res, request.signal));
+        const candidate = data.candidates?.[0];
+        const parts = candidate?.content?.parts || [];
+        let content = "";
+        let reasoning = "";
+        const fnCalls = [];
+        for (const p of parts) {
+            if (p.thought) {
+                reasoning += p.text || "";
+            }
+            else if (p.functionCall) {
+                fnCalls.push({ name: p.functionCall.name, args: p.functionCall.args ?? {}, call_id: crypto.randomUUID(), thought_signature: p.thoughtSignature });
+            }
+            else {
+                content += p.text || "";
+            }
+        }
+        const thoughtSignature = this.getNonToolThoughtSignature(parts, request.parameters?._replay_thought_signatures === true);
+        const toolCalls = fnCalls.length > 0 ? fnCalls : undefined;
+        const groundingMetadata = candidate?.groundingMetadata ?? data.groundingMetadata;
+        return {
+            content,
+            reasoning: reasoning || undefined,
+            finish_reason: toolCalls ? "tool_calls" : (candidate?.finishReason || "STOP"),
+            tool_calls: toolCalls,
+            ...(thoughtSignature ? { thought_signature: thoughtSignature } : {}),
+            usage: data.usageMetadata
+                ? {
+                    prompt_tokens: data.usageMetadata.promptTokenCount || 0,
+                    completion_tokens: data.usageMetadata.candidatesTokenCount || 0,
+                    total_tokens: data.usageMetadata.totalTokenCount || 0,
+                    ...(groundingMetadata ? { provider_raw: { groundingMetadata } } : {}),
+                }
+                : undefined,
+        };
+    }
+    async *generateStream(apiKey, apiUrl, request) {
+        const { sa, projectId, location } = this.resolveProjectConfig(apiKey, apiUrl);
+        const accessToken = await getAccessToken(sa);
+        const base = this.endpointBase(projectId, location);
+        const model = this.sanitizeModelId(request.model);
+        const url = `${base}/${model}:streamGenerateContent?alt=sse`;
+        const body = this.buildBody(request);
+        const res = await fetchWithPreflightAbort(url, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${accessToken}`,
+            },
+            body: JSON.stringify(body),
+        }, request.signal);
+        if (!res.ok)
+            await throwProviderResponseError("Vertex AI", "stream", res);
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        const maybeYield = createCooperativeYielder(64, request.signal);
+        let streamDoneNaturally = false;
+        try {
+            while (true) {
+                const { done, value } = await readWithAbort(reader, request.signal);
+                if (done) {
+                    streamDoneNaturally = !request.signal?.aborted;
+                    break;
+                }
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split("\n");
+                buffer = lines.pop() || "";
+                for (const line of lines) {
+                    await maybeYield();
+                    const trimmed = line.trim();
+                    if (!trimmed || !trimmed.startsWith("data: "))
+                        continue;
+                    try {
+                        const data = JSON.parse(trimmed.slice(6));
+                        const candidate = data.candidates?.[0];
+                        const parts = candidate?.content?.parts || [];
+                        const finishReason = candidate?.finishReason;
+                        let text = "";
+                        let reasoning = "";
+                        const fnCalls = [];
+                        for (const p of parts) {
+                            if (p.thought) {
+                                reasoning += p.text || "";
+                            }
+                            else if (p.functionCall) {
+                                fnCalls.push({ name: p.functionCall.name, args: p.functionCall.args ?? {}, call_id: crypto.randomUUID(), thought_signature: p.thoughtSignature });
+                            }
+                            else {
+                                text += p.text || "";
+                            }
+                        }
+                        const thoughtSignature = this.getNonToolThoughtSignature(parts, request.parameters?._replay_thought_signatures === true);
+                        const usage = data.usageMetadata
+                            ? {
+                                prompt_tokens: data.usageMetadata.promptTokenCount || 0,
+                                completion_tokens: data.usageMetadata.candidatesTokenCount || 0,
+                                total_tokens: data.usageMetadata.totalTokenCount || 0,
+                                ...((candidate?.groundingMetadata ?? data.groundingMetadata)
+                                    ? { provider_raw: { groundingMetadata: candidate?.groundingMetadata ?? data.groundingMetadata } }
+                                    : {}),
+                            }
+                            : undefined;
+                        const toolCalls = fnCalls.length > 0 ? fnCalls : undefined;
+                        if (text || reasoning || toolCalls || thoughtSignature) {
+                            yield {
+                                token: text,
+                                reasoning: reasoning || undefined,
+                                finish_reason: toolCalls ? "tool_calls" : (finishReason === "STOP" ? "stop" : undefined),
+                                tool_calls: toolCalls,
+                                ...(thoughtSignature ? { thought_signature: thoughtSignature } : {}),
+                                usage,
+                            };
+                        }
+                        else if (finishReason || usage) {
+                            yield { token: "", finish_reason: finishReason === "STOP" ? "stop" : (finishReason || undefined), usage };
+                        }
+                    }
+                    catch {
+                        // Skip malformed SSE lines
+                    }
+                }
+            }
+        }
+        finally {
+            if (!streamDoneNaturally)
+                await cancelStreamAndCloseConnection(reader, res);
+        }
+    }
+    async validateKey(apiKey, apiUrl) {
+        const { sa, location } = this.resolveProjectConfig(apiKey, apiUrl);
+        const accessToken = await getAccessToken(sa);
+        const host = vertexHostForLocation(location);
+        // See listModels() for URL rationale. The publisher-list endpoint is
+        // un-prefixed (no project/location in the path) and lives at v1beta1.
+        const url = `${host}/v1beta1/publishers/google/models?pageSize=1`;
+        const res = await fetch(url, {
+            headers: { Authorization: `Bearer ${accessToken}` },
+        });
+        return res.ok;
+    }
+    async listModels(apiKey, apiUrl) {
+        const { sa, location } = this.resolveProjectConfig(apiKey, apiUrl);
+        const accessToken = await getAccessToken(sa);
+        const host = vertexHostForLocation(location);
+        const allModels = [];
+        let pageToken;
+        do {
+            const params = new URLSearchParams();
+            if (pageToken)
+                params.set("pageToken", pageToken);
+            // List base (publisher) models. Per Google's @google/genai SDK
+            // (`_api_client.ts` → `shouldPrependVertexProjectPath`):
+            //   "For base models Vertex does not accept a project/location
+            //    prefix (for tuned models the prefix is required)."
+            // So the URL is un-prefixed and sits at v1beta1 (the SDK's default
+            // version for Vertex; the v1 surface does not expose this list).
+            //   →  {host}/v1beta1/publishers/google/models
+            const url = `${host}/v1beta1/publishers/google/models${params.toString() ? `?${params}` : ""}`;
+            const data = await fetchProviderJson(this.displayName, "model listing", url, {
+                headers: { Authorization: `Bearer ${accessToken}` },
+            });
+            // Response may use `publisherModels`, `models`, or `tunedModels`
+            // depending on the surface — mirrors tExtractModels() in the SDK.
+            const models = data.publisherModels || data.models || data.tunedModels || [];
+            for (const m of models) {
+                // Names are "publishers/google/models/{id}".
+                const name = m.name || "";
+                const shortName = name.replace(/^publishers\/google\/models\//, "");
+                const id = shortName || name;
+                if (id)
+                    allModels.push(id);
+            }
+            pageToken = data.nextPageToken;
+        } while (pageToken);
+        return allModels.sort();
+    }
+    // ── Body building (mirrors GoogleProvider.buildBody) ──────────────────
+    getNonToolThoughtSignature(parts, enabled) {
+        if (!enabled)
+            return undefined;
+        for (let index = parts.length - 1; index >= 0; index--) {
+            const part = parts[index];
+            if (!part?.functionCall && typeof part?.thoughtSignature === "string") {
+                return part.thoughtSignature;
+            }
+        }
+        return undefined;
+    }
+    formatParts(m, toolNameById, replayThoughtSignatures) {
+        if (typeof m.content === "string") {
+            return [{
+                    text: m.content,
+                    ...(m.role === "assistant" && replayThoughtSignatures && m.thought_signature
+                        ? { thoughtSignature: m.thought_signature }
+                        : {}),
+                }];
+        }
+        const formatted = m.content.map((part) => {
+            switch (part.type) {
+                case "text":
+                    return {
+                        text: part.text,
+                        ...(m.role === "assistant" && replayThoughtSignatures && part.thought_signature
+                            ? { thoughtSignature: part.thought_signature }
+                            : {}),
+                    };
+                case "image":
+                case "audio":
+                    return { inlineData: { mimeType: part.mime_type, data: part.data } };
+                case "tool_use":
+                    return { functionCall: { name: part.name, args: part.input }, thoughtSignature: part.thought_signature || "context_engineering_is_the_way_to_go" };
+                case "tool_result": {
+                    let payload = part.content;
+                    try {
+                        payload = JSON.parse(part.content);
+                    }
+                    catch { /* keep as string */ }
+                    const key = part.is_error ? "error" : "output";
+                    const response = { [key]: payload };
+                    const name = toolNameById.get(part.tool_use_id) ?? "tool";
+                    return { functionResponse: { name, response } };
+                }
+                default:
+                    return { text: "" };
+            }
+        });
+        if (m.role === "assistant" && replayThoughtSignatures && m.thought_signature) {
+            const target = [...formatted].reverse().find((part) => Object.hasOwn(part, "text") || Object.hasOwn(part, "inlineData"));
+            if (target)
+                target.thoughtSignature = m.thought_signature;
+        }
+        return formatted;
+    }
+    buildToolNameMap(messages) {
+        const map = new Map();
+        for (const m of messages) {
+            if (typeof m.content === "string")
+                continue;
+            for (const p of m.content) {
+                if (p.type === "tool_use")
+                    map.set(p.id, p.name);
+            }
+        }
+        return map;
+    }
+    static INTERNAL_PARAMS = new Set(["max_context_length", "_include_usage", "_streaming", "_replay_thought_signatures"]);
+    static HANDLED_PARAMS = new Set([
+        "temperature", "max_tokens", "top_p", "top_k", "stop", "thinkingConfig",
+        "responseMimeType", "responseSchema", "responseJsonSchema",
+        ...GOOGLE_SEARCH_HANDLED_PARAMS,
+    ]);
+    buildBody(request) {
+        const params = request.parameters || {};
+        const systemMessages = request.messages.filter((m) => m.role === "system");
+        const otherMessages = request.messages.filter((m) => m.role !== "system");
+        const toolNameById = this.buildToolNameMap(request.messages);
+        const replayThoughtSignatures = params._replay_thought_signatures === true;
+        const functionTools = request.tools ?? [];
+        const hasFunctionDeclarations = functionTools.length > 0;
+        const googleSearchTool = buildGoogleSearchTool(this.name, request.model, params, hasFunctionDeclarations);
+        const body = {
+            contents: otherMessages.map((m) => ({
+                role: m.role === "assistant" ? "model" : "user",
+                parts: this.formatParts(m, toolNameById, replayThoughtSignatures),
+            })),
+        };
+        if (systemMessages.length > 0) {
+            body.systemInstruction = {
+                parts: [{ text: systemMessages.map((m) => getTextContent(m)).join("\n\n") }],
+            };
+        }
+        const generationConfig = {};
+        if (params.temperature !== undefined)
+            generationConfig.temperature = params.temperature;
+        if (params.max_tokens !== undefined)
+            generationConfig.maxOutputTokens = params.max_tokens;
+        if (params.top_p !== undefined)
+            generationConfig.topP = params.top_p;
+        if (params.top_k !== undefined)
+            generationConfig.topK = params.top_k;
+        if (params.stop)
+            generationConfig.stopSequences = params.stop;
+        if (params.thinkingConfig) {
+            generationConfig.thinkingConfig = params.thinkingConfig;
+        }
+        if (params.responseMimeType !== undefined) {
+            generationConfig.responseMimeType = params.responseMimeType;
+        }
+        const responseSchema = params.responseSchema ?? params.responseJsonSchema;
+        if (responseSchema !== undefined) {
+            generationConfig.responseSchema = responseSchema;
+        }
+        if (Object.keys(generationConfig).length > 0) {
+            body.generationConfig = generationConfig;
+        }
+        // Passthrough extra params
+        for (const key of Object.keys(params)) {
+            if (body[key] !== undefined)
+                continue;
+            if (GoogleVertexProvider.HANDLED_PARAMS.has(key))
+                continue;
+            if (GoogleVertexProvider.INTERNAL_PARAMS.has(key))
+                continue;
+            body[key] = params[key];
+        }
+        // Default safety settings: disable all content filters unless the user
+        // has already provided their own safetySettings via passthrough.
+        // Vertex AI uses "OFF" (not "BLOCK_NONE" which is the AI Studio value).
+        if (!body.safetySettings) {
+            body.safetySettings = [
+                { category: "HARM_CATEGORY_HARASSMENT", threshold: "OFF" },
+                { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "OFF" },
+                { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "OFF" },
+                { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "OFF" },
+            ];
+        }
+        if (hasFunctionDeclarations) {
+            body.tools = [{
+                    functionDeclarations: functionTools.map((t) => ({
+                        name: t.name,
+                        description: t.description,
+                        parameters: sanitizeGeminiSchema(t.parameters),
+                    })),
+                }];
+        }
+        appendGoogleSearchTool(this.name, body, googleSearchTool);
+        return body;
+    }
+}

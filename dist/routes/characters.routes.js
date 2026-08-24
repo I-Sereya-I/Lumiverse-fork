@@ -1,0 +1,1110 @@
+import { Hono } from "hono";
+import * as svc from "../services/characters.service";
+import * as files from "../services/files.service";
+import * as images from "../services/images.service";
+import * as cardSvc from "../services/character-card.service";
+import * as characterLoraSvc from "../services/character-lora.service";
+import * as exportSvc from "../services/character-export.service";
+import * as tagLibrarySvc from "../services/tag-library-import.service";
+import * as wbSvc from "../services/world-books.service";
+import * as regexSvc from "../services/regex-scripts.service";
+import * as gallerySvc from "../services/character-gallery.service";
+import { fetchChubGalleryUrls, fetchChubJson } from "../services/chub-api.service";
+import { parsePagination } from "../services/pagination";
+import { safeFetch, SSRFError, validateHost } from "../utils/safe-fetch";
+import { rewriteBotBooruUrl } from "../utils/botbooru";
+import { createAvatarResolverResponse } from "../utils/avatar-cache";
+import { buildSlug } from "../lumihub/manifest";
+import { applyCharxModulesAndAssets, autoImportEmbeddedWorldbook } from "../services/charx-import.service";
+import { mapWithConcurrency } from "../utils/concurrency";
+import { eventBus } from "../ws/bus";
+import { EventType } from "../ws/events";
+const app = new Hono();
+const PERSPECTIVE_LAYERS = new Set(["background", "framing", "subject"]);
+function parseLibraryScope(raw) {
+    try {
+        return svc.normalizeCharacterLibraryScope(raw);
+    }
+    catch {
+        return null;
+    }
+}
+function isInvalidLibraryScopeError(err) {
+    return err instanceof svc.InvalidCharacterLibraryScopeError || (typeof err === "object" && err !== null && err.code === "INVALID_CHARACTER_LIBRARY_SCOPE");
+}
+function respondInvalidLibraryScope(c) { return c.json({ error: "invalid_scope" }, 400); }
+// ─── Import error response helper ────────────────────────────────────────
+function respondImportError(c, err, fallbackMessage) {
+    // Log every import failure server-side so silent 4xx responses are traceable.
+    // Generic 400s from the old code swallowed this — which is how a 500 MB
+    // decompression-cap hit looked like "no backend error" to operators.
+    console.error("[character import] failed:", err);
+    if (isInvalidLibraryScopeError(err))
+        return respondInvalidLibraryScope(c);
+    if (err instanceof cardSvc.CharacterImportError) {
+        return c.json({ error: err.message, code: err.code }, err.status);
+    }
+    return c.json({ error: err?.message || fallbackMessage }, 400);
+}
+// Bind any card-embedded regex scripts (Lumiverse bundle or SillyTavern) to a
+// freshly-imported character. Best-effort: the character already exists, so a
+// regex failure must not fail the import. CHARX imports bind their own bundle
+// via applyCharxModulesAndAssets, so this is only used on the non-CHARX paths.
+function importCardRegexBestEffort(userId, characterId, extensions) {
+    try {
+        regexSvc.importCharacterBoundRegexScripts(userId, characterId, extensions);
+    }
+    catch (err) {
+        console.error("[character import] regex import failed:", err);
+    }
+}
+// These values refer to locally-owned entities rather than portable card data.
+// Replacing a JSON/PNG card must not detach or delete the user's avatar,
+// expression assets, world book links, or selected TTS voice.
+const LOCAL_CHARACTER_EXTENSION_KEYS = new Set([
+    "expressions",
+    "expression_groups",
+    "alternate_fields",
+    "alternate_avatars",
+    "world_book_id",
+    "world_book_ids",
+    "avatar_crop_image_id",
+    "original_image_id",
+    "risu_asset_map",
+    "gallery_reference_sequence",
+    "landing_perspective_layers",
+    "ttsVoice",
+]);
+function buildCardReplacementInput(existing, card) {
+    const preservedExtensions = Object.fromEntries(Object.entries(existing.extensions ?? {}).filter(([key]) => LOCAL_CHARACTER_EXTENSION_KEYS.has(key) || key.startsWith("_lumiverse_")));
+    return {
+        // Deliberately omit `name`: this endpoint only replaces card contents.
+        description: card.description ?? "",
+        personality: card.personality ?? "",
+        scenario: card.scenario ?? "",
+        first_mes: card.first_mes ?? "",
+        mes_example: card.mes_example ?? "",
+        creator: card.creator ?? "",
+        creator_notes: card.creator_notes ?? "",
+        system_prompt: card.system_prompt ?? "",
+        post_history_instructions: card.post_history_instructions ?? "",
+        tags: card.tags ?? [],
+        alternate_greetings: card.alternate_greetings ?? [],
+        extensions: {
+            ...(card.extensions ?? {}),
+            ...preservedExtensions,
+        },
+    };
+}
+// ─── Portable LoRA surfacing ──────────────────────────────────────────────
+//
+// The portable LoRA reference (lumiverse_image_gen_lora) rides along in a
+// character's `extensions` on every import format. We surface it in the import
+// response as `lumiverse_lora` so the UI can show "this character expects
+// <file> @ <weight>" and let the user confirm a binding. We deliberately do NOT
+// auto-bind it: the runtime binding is per-user and may point at a different
+// local LoRA library (and source_url is never auto-fetched).
+function loraSurface(character) {
+    const ref = character ? characterLoraSvc.readPortableLoraReference(character) : null;
+    return ref ? { lumiverse_lora: ref } : {};
+}
+// ─── URL parsing helpers ──────────────────────────────────────────────────
+const CHUB_DOMAINS = ["chub.ai", "www.chub.ai", "characterhub.org", "www.characterhub.org"];
+const JANNY_DOMAINS = ["janitorai.com", "www.janitorai.com", "jannyai.com", "www.jannyai.com"];
+function parseChubUrl(url) {
+    try {
+        const parsed = new URL(url);
+        if (!CHUB_DOMAINS.includes(parsed.hostname.toLowerCase()))
+            return null;
+        const segments = parsed.pathname.split("/").filter(Boolean);
+        const start = segments[0]?.toLowerCase() === "characters" ? 1 : 0;
+        if (segments.length - start >= 2) {
+            return segments.slice(start, start + 2).map(decodeURIComponent).join("/");
+        }
+        return null;
+    }
+    catch {
+        // Fall through to legacy loose parsing below for pasted strings that URL()
+        // will not accept but still contain a recognizable Chub path.
+    }
+    const parts = url.split("/");
+    let domainIdx = -1;
+    for (let i = 0; i < parts.length; i++) {
+        if (CHUB_DOMAINS.includes(parts[i].toLowerCase())) {
+            domainIdx = i;
+            break;
+        }
+    }
+    if (domainIdx === -1)
+        return null;
+    const rest = parts.slice(domainIdx + 1);
+    // Strip leading "characters" segment if present
+    const start = rest[0]?.toLowerCase() === "characters" ? 1 : 0;
+    const pathParts = rest.slice(start).map((part) => part.split(/[?#]/, 1)[0]).filter(Boolean);
+    if (pathParts.length >= 2) {
+        return pathParts.slice(0, 2).join("/");
+    }
+    return null;
+}
+const UUID_RE = /[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/i;
+function parseJannyUrl(url) {
+    try {
+        const parsed = new URL(url);
+        if (!JANNY_DOMAINS.includes(parsed.hostname.toLowerCase()))
+            return null;
+    }
+    catch {
+        return null;
+    }
+    const match = url.match(UUID_RE);
+    return match ? match[0] : null;
+}
+// ─── Chub.ai character fetcher ────────────────────────────────────────────
+async function fetchChubLorebookDefinition(idOrPath) {
+    try {
+        const raw = String(idOrPath).replace(/^lorebooks\//, "");
+        const data = await fetchChubJson(`lorebooks/${raw}?full=true`);
+        return data?.node?.definition ?? null;
+    }
+    catch {
+        return null;
+    }
+}
+async function buildChubCharacterBook(def, data) {
+    const embeddedBook = def.embedded_lorebook ?? def.character_book;
+    const embeddedEntries = Array.isArray(embeddedBook?.entries) ? embeddedBook.entries : [];
+    const relatedLorebooks = Array.isArray(data.node?.related_lorebooks) ? data.node.related_lorebooks : [];
+    if (relatedLorebooks.length === 0)
+        return embeddedBook || undefined;
+    const linkedBooks = await Promise.all(relatedLorebooks.map(async (id) => {
+        const relatedNode = data.nodes?.[String(id)];
+        const definition = await fetchChubLorebookDefinition(relatedNode?.fullPath || id);
+        const entries = definition?.embedded_lorebook?.entries ?? definition?.character_book?.entries;
+        if (!Array.isArray(entries) || entries.length === 0)
+            return null;
+        return {
+            id,
+            name: relatedNode?.name || definition?.name || "Linked Lorebook",
+            entries,
+        };
+    }));
+    const linkedEntries = linkedBooks.flatMap((book) => book?.entries ?? []);
+    const entries = [...embeddedEntries, ...linkedEntries];
+    if (entries.length === 0)
+        return embeddedBook || undefined;
+    return {
+        ...(embeddedBook && typeof embeddedBook === "object" ? embeddedBook : {}),
+        name: linkedEntries.length > 0 ? `${def.name || data.node?.name || "Character"} Lorebooks` : embeddedBook?.name,
+        entries,
+    };
+}
+async function importGalleryFromUrls(userId, characterId, urls) {
+    const downloaded = await mapWithConcurrency(urls, 6, async (url) => {
+        try {
+            const res = await safeFetch(url, { timeoutMs: 15_000, maxBytes: 50 * 1024 * 1024 });
+            if (!res.ok)
+                return null;
+            const buf = await res.arrayBuffer();
+            const contentType = res.headers.get("content-type") || "image/webp";
+            const ext = contentType.includes("png") ? "png" : contentType.includes("jpeg") || contentType.includes("jpg") ? "jpg" : "webp";
+            return new File([buf], `chub_gallery_${crypto.randomUUID()}.${ext}`, { type: contentType });
+        }
+        catch {
+            return null;
+        }
+    });
+    const files = downloaded.filter((file) => file !== null);
+    if (files.length === 0)
+        return;
+    if (files.length > 3) {
+        await gallerySvc.uploadBulkToGallery(userId, characterId, files);
+        return;
+    }
+    for (const file of files) {
+        try {
+            await gallerySvc.uploadToGallery(userId, characterId, file);
+        }
+        catch { /* skip */ }
+    }
+}
+async function fetchChubCharacter(chubPath, userId, libraryScope) {
+    const data = await fetchChubJson(`characters/${chubPath}?full=true`);
+    const node = data?.node;
+    if (!node)
+        throw new Error("Invalid Chub API response: missing node");
+    const def = node.definition ?? node;
+    const name = def.name || node.name;
+    if (!name)
+        throw new Error("Character card from Chub is missing a name");
+    // Build a V2-style card object for parseCardJson
+    // Chub API field names differ from the standard card spec:
+    //   Chub "personality"        → card "description"
+    //   Chub "tavern_personality" → card "personality"
+    //   Chub "description"        → card "creator_notes"
+    //   Chub "example_dialogs"    → card "mes_example"
+    //   Chub "first_message"      → card "first_mes"
+    //   Chub "embedded_lorebook"  → card "character_book"
+    const creatorName = node.fullPath?.split("/")[0] ?? "";
+    const card = {
+        spec: "chara_card_v2",
+        spec_version: "2.0",
+        data: {
+            name,
+            description: def.personality ?? def.description ?? "",
+            personality: def.tavern_personality ?? def.personality ?? "",
+            scenario: def.scenario ?? "",
+            first_mes: def.first_message ?? def.first_mes ?? "",
+            mes_example: def.example_dialogs ?? def.mes_example ?? "",
+            creator: creatorName,
+            creator_notes: def.description ?? def.creator_notes ?? "",
+            system_prompt: def.system_prompt ?? "",
+            post_history_instructions: def.post_history_instructions ?? "",
+            tags: Array.isArray(node.topics) ? node.topics : (Array.isArray(def.tags) ? def.tags : []),
+            alternate_greetings: Array.isArray(def.alternate_greetings) ? def.alternate_greetings : [],
+            extensions: def.extensions ?? {},
+        },
+    };
+    const characterBook = await buildChubCharacterBook(def, data);
+    if (characterBook) {
+        card.data.character_book = characterBook;
+    }
+    const cardInput = cardSvc.parseCardJson(card);
+    const character = svc.createCharacter(userId, { ...cardInput, library_scope: libraryScope });
+    importCardRegexBestEffort(userId, character.id, cardInput.extensions);
+    // Fetch avatar image
+    const avatarUrl = node.max_res_url || node.avatar_url;
+    if (avatarUrl) {
+        try {
+            const imgRes = await safeFetch(avatarUrl, { timeoutMs: 15_000, maxBytes: 50 * 1024 * 1024 });
+            if (imgRes.ok) {
+                const buf = await imgRes.arrayBuffer();
+                const contentType = imgRes.headers.get("content-type") || "image/png";
+                const ext = contentType.includes("webp") ? "webp" : contentType.includes("jpeg") || contentType.includes("jpg") ? "jpg" : "png";
+                const file = new File([buf], `${character.id}.${ext}`, { type: contentType });
+                const image = await images.uploadImage(userId, file);
+                svc.setCharacterImage(userId, character.id, image.id);
+                svc.setCharacterAvatar(userId, character.id, image.filename);
+            }
+        }
+        catch {
+            // Avatar fetch failed — character is still imported, just without an avatar
+        }
+    }
+    // Stamp install source so LumiHub manifest can track this card for updates
+    try {
+        const freshChar = svc.getCharacter(userId, character.id);
+        if (freshChar) {
+            const slug = buildSlug(freshChar.creator, freshChar.name);
+            svc.updateCharacter(userId, character.id, {
+                extensions: {
+                    ...(freshChar.extensions || {}),
+                    _lumiverse_install_source: "chub",
+                    _lumiverse_install_slug: slug,
+                    _lumiverse_chub_slug: chubPath.toLowerCase(),
+                },
+            });
+        }
+    }
+    catch {
+        // Non-critical — manifest will still work via creator/name derivation
+    }
+    autoImportEmbeddedWorldbook(userId, character.id);
+    const galleryUrls = await fetchChubGalleryUrls(node.id);
+    if (galleryUrls.length > 0) {
+        await importGalleryFromUrls(userId, character.id, galleryUrls);
+    }
+    return svc.getCharacter(userId, character.id);
+}
+// ─── JannyAI character fetcher ────────────────────────────────────────────
+async function fetchJannyCharacter(uuid, userId, libraryScope) {
+    // safeFetch is GET-only; JannyAI requires POST — validate host then POST directly
+    await validateHost("api.jannyai.com");
+    const downloadRes = await fetch("https://api.jannyai.com/api/v1/download", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ characterId: uuid }),
+        signal: AbortSignal.timeout(15_000),
+    });
+    if (!downloadRes.ok) {
+        throw new Error(`JannyAI API returned ${downloadRes.status}`);
+    }
+    const result = await downloadRes.json();
+    if (result.status !== "ok" || !result.downloadUrl) {
+        throw new Error(result.error || "JannyAI download failed");
+    }
+    // Download the PNG card from the provided URL.
+    // Use plain fetch (not safeFetch) — the download URL is a CDN/presigned URL from
+    // JannyAI's own API. safeFetch's manual redirect handling breaks CDN redirects.
+    // This matches SillyTavern's approach.
+    const downloadUrl = new URL(result.downloadUrl);
+    await validateHost(downloadUrl.hostname);
+    const pngRes = await fetch(result.downloadUrl, { signal: AbortSignal.timeout(15_000) });
+    if (!pngRes.ok) {
+        throw new Error(`Failed to download JannyAI character image: ${pngRes.status}`);
+    }
+    const buf = await pngRes.arrayBuffer();
+    const file = new File([buf], `${uuid}.png`, { type: "image/png" });
+    const cardInput = cardSvc.normalizeJannyCharacterInput(await cardSvc.extractCardFromPng(file));
+    const character = svc.createCharacter(userId, { ...cardInput, library_scope: libraryScope });
+    // Use the PNG as avatar
+    const image = await images.uploadImage(userId, file);
+    svc.setCharacterImage(userId, character.id, image.id);
+    svc.setCharacterAvatar(userId, character.id, image.filename);
+    autoImportEmbeddedWorldbook(userId, character.id);
+    return svc.getCharacter(userId, character.id);
+}
+// ─── Generic URL fetcher (PNG or JSON) ────────────────────────────────────
+/**
+ * Detect a binary card container by its magic bytes. Needed because some
+ * sources (e.g. BotBooru's /download/png/{id}) serve cards from extensionless
+ * URLs, so neither the `.png`/`.charx` suffix nor a trustworthy Content-Type
+ * may be present.
+ */
+function sniffCardContainer(buf) {
+    const b = new Uint8Array(buf, 0, Math.min(8, buf.byteLength));
+    // PNG: 89 50 4E 47 0D 0A 1A 0A
+    if (b.length >= 8 &&
+        b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47 &&
+        b[4] === 0x0d && b[5] === 0x0a && b[6] === 0x1a && b[7] === 0x0a) {
+        return "png";
+    }
+    // ZIP (charx): "PK" followed by a local-file / central-dir / end-of-archive marker
+    if (b.length >= 4 && b[0] === 0x50 && b[1] === 0x4b && (b[2] === 0x03 || b[2] === 0x05 || b[2] === 0x07)) {
+        return "zip";
+    }
+    return null;
+}
+async function fetchGenericCharacter(url, userId, libraryScope) {
+    const res = await safeFetch(url, { timeoutMs: 15_000, maxBytes: 100 * 1024 * 1024 });
+    if (!res.ok)
+        throw new Error(`Failed to fetch URL: ${res.status}`);
+    const contentType = res.headers.get("content-type") || "";
+    const buf = await res.arrayBuffer();
+    const sniffed = sniffCardContainer(buf);
+    if (sniffed === "png" || contentType.includes("image/png") || url.toLowerCase().endsWith(".png")) {
+        const file = new File([buf], "import.png", { type: "image/png" });
+        const cardInput = await cardSvc.extractCardFromPng(file);
+        const character = svc.createCharacter(userId, { ...cardInput, library_scope: libraryScope });
+        const image = await images.uploadImage(userId, file);
+        svc.setCharacterImage(userId, character.id, image.id);
+        svc.setCharacterAvatar(userId, character.id, image.filename);
+        autoImportEmbeddedWorldbook(userId, character.id);
+        return svc.getCharacter(userId, character.id);
+    }
+    if (sniffed === "zip" || contentType.includes("application/zip") || url.toLowerCase().endsWith(".charx")) {
+        const file = new File([buf], "import.charx", { type: "application/zip" });
+        const charxResult = await cardSvc.extractCardFromCharx(file);
+        const character = svc.createCharacter(userId, { ...charxResult.card, library_scope: libraryScope });
+        await applyCharxModulesAndAssets(userId, character, charxResult);
+        return svc.getCharacter(userId, character.id);
+    }
+    // Assume JSON
+    const text = new TextDecoder().decode(buf);
+    let json;
+    try {
+        json = JSON.parse(text);
+    }
+    catch {
+        throw new Error("URL did not return valid PNG, CHARX, or JSON character data");
+    }
+    const cardInput = cardSvc.parseCardJson(json);
+    const character = svc.createCharacter(userId, { ...cardInput, library_scope: libraryScope });
+    autoImportEmbeddedWorldbook(userId, character.id);
+    return svc.getCharacter(userId, character.id);
+}
+app.get("/", (c) => {
+    const userId = c.get("userId");
+    const pagination = parsePagination(c.req.query("limit"), c.req.query("offset"));
+    const sort = c.req.query("sort");
+    if (sort === "discover") {
+        const rawSeed = c.req.query("seed");
+        const seed = rawSeed ? parseInt(rawSeed, 10) : undefined;
+        return c.json(svc.listCharactersDiscover(userId, pagination, isNaN(seed) ? undefined : seed));
+    }
+    return c.json(svc.listCharacters(userId, pagination));
+});
+// ─── Lightweight summary endpoint for character browser ───────────────────
+app.get("/summary", (c) => {
+    const userId = c.get("userId");
+    const rawScope = c.req.query("scope");
+    const scope = rawScope === undefined ? undefined : parseLibraryScope(rawScope);
+    if (rawScope !== undefined && !scope)
+        return c.json({ error: "scope must be either 'mine' or 'shared'" }, 400);
+    const pagination = parsePagination(c.req.query("limit"), c.req.query("offset"));
+    const search = c.req.query("search") || undefined;
+    const rawTags = c.req.query("tags");
+    const tags = rawTags ? rawTags.split(",").map((t) => t.trim()).filter(Boolean) : undefined;
+    const rawExcludeTags = c.req.query("exclude_tags");
+    const excludeTags = rawExcludeTags ? rawExcludeTags.split(",").map((t) => t.trim()).filter(Boolean) : undefined;
+    const sort = c.req.query("sort") || undefined;
+    const direction = c.req.query("direction") || undefined;
+    const filterMode = c.req.query("filter") || undefined;
+    const rawSeed = c.req.query("seed");
+    const seed = rawSeed ? parseInt(rawSeed, 10) : undefined;
+    const rawFavorites = c.req.query("favorite_ids");
+    const favoriteIds = rawFavorites ? rawFavorites.split(",").filter(Boolean) : undefined;
+    const chatId = c.req.query("chat_id") || undefined;
+    return c.json(svc.listCharacterSummaries(userId, pagination, {
+        search,
+        tags,
+        excludeTags,
+        sort,
+        direction,
+        favoriteIds,
+        filterMode,
+        seed: isNaN(seed) ? undefined : seed,
+        chatId,
+        ...(scope ? { scope } : {}),
+    }));
+});
+// ─── Tags endpoint for character browser ──────────────────────────────────
+app.get("/tags", (c) => {
+    const userId = c.get("userId");
+    return c.json(svc.listCharacterTags(userId));
+});
+// ─── Bulk tag update (batch-select bar) ───────────────────────────────────
+app.post("/bulk-tags", async (c) => {
+    const userId = c.get("userId");
+    const body = await c.req.json();
+    try {
+        const result = svc.bulkUpdateCharacterTags(userId, {
+            ids: Array.isArray(body?.ids) ? body.ids : [],
+            operation: body?.operation,
+            tags: Array.isArray(body?.tags) ? body.tags : [],
+        });
+        return c.json(result);
+    }
+    catch (err) {
+        const message = err instanceof Error ? err.message : "Failed to update tags";
+        return c.json({ error: message }, 400);
+    }
+});
+app.post("/folders/rename", async (c) => {
+    const userId = c.get("userId");
+    const body = await c.req.json();
+    const oldName = body.old_name?.trim() || "";
+    const newName = body.new_name?.trim() || "";
+    if (!oldName)
+        return c.json({ error: "old_name is required" }, 400);
+    if (!newName)
+        return c.json({ error: "new_name is required" }, 400);
+    const updated = svc.renameCharacterFolder(userId, oldName, newName);
+    if (updated.length === 0)
+        return c.json({ error: "Folder not found" }, 404);
+    return c.json({ updated, count: updated.length });
+});
+app.post("/folders/delete", async (c) => {
+    const userId = c.get("userId");
+    const body = await c.req.json();
+    const name = body.name?.trim() || "";
+    if (!name)
+        return c.json({ error: "name is required" }, 400);
+    const updated = svc.deleteCharacterFolder(userId, name);
+    return c.json({ updated, count: updated.length });
+});
+app.post("/bulk-update", async (c) => {
+    const userId = c.get("userId");
+    const body = await c.req.json();
+    if (!Array.isArray(body.ids) || body.ids.length === 0 || body.ids.length > 1000) {
+        return c.json({ error: "ids must be a non-empty array with at most 1000 items" }, 400);
+    }
+    const ids = body.ids.filter((id) => typeof id === "string" && id.length > 0);
+    if (ids.length === 0)
+        return c.json({ error: "ids must contain character ids" }, 400);
+    if (typeof body.folder !== "string")
+        return c.json({ error: "folder must be a string" }, 400);
+    const updated = svc.bulkUpdateCharacterFolders(userId, ids, body.folder);
+    return c.json({ updated, count: updated.length });
+});
+app.post("/batch-delete", async (c) => {
+    const userId = c.get("userId");
+    const body = await c.req.json().catch(() => ({}));
+    if (!Array.isArray(body.ids) || body.ids.length === 0 || body.ids.length > 1000) {
+        return c.json({ error: "ids must be a non-empty array with at most 1000 items" }, 400);
+    }
+    const ids = body.ids.filter((id) => typeof id === "string" && id.length > 0);
+    if (ids.length === 0)
+        return c.json({ error: "ids must contain character ids" }, 400);
+    return c.json(await svc.batchDeleteCharacters(userId, ids));
+});
+app.post("/", async (c) => {
+    const userId = c.get("userId");
+    const body = await c.req.json();
+    if (!body.name)
+        return c.json({ error: "name is required" }, 400);
+    try {
+        return c.json(svc.createCharacter(userId, body), 201);
+    }
+    catch (err) {
+        if (isInvalidLibraryScopeError(err))
+            return respondInvalidLibraryScope(c);
+        throw err;
+    }
+});
+// --- Static routes MUST come before /:id to avoid shadowing ---
+app.post("/import-url", async (c) => {
+    const userId = c.get("userId");
+    const body = await c.req.json();
+    const libraryScope = body?.library_scope === undefined ? undefined : parseLibraryScope(body.library_scope);
+    if (body?.library_scope !== undefined && !libraryScope)
+        return c.json({ error: "library_scope must be either 'mine' or 'shared'" }, 400);
+    const url = body.url;
+    if (!url || typeof url !== "string")
+        return c.json({ error: "url is required" }, 400);
+    try {
+        let character;
+        // Check for Chub.ai URL
+        const chubPath = parseChubUrl(url);
+        if (chubPath) {
+            character = await fetchChubCharacter(chubPath, userId, libraryScope || "mine");
+            return c.json({ character, ...loraSurface(character) }, 201);
+        }
+        // Check for JannyAI URL
+        const jannyId = parseJannyUrl(url);
+        if (jannyId) {
+            character = await fetchJannyCharacter(jannyId, userId, libraryScope || "mine");
+            return c.json({ character, ...loraSurface(character) }, 201);
+        }
+        // Check for BotBooru URL → rewrite to the PNG download, which embeds a
+        // SillyTavern-compatible card *and* an avatar, then reuse the generic importer.
+        const botBooruPngUrl = rewriteBotBooruUrl(url, "png");
+        if (botBooruPngUrl) {
+            character = await fetchGenericCharacter(botBooruPngUrl, userId, libraryScope || "mine");
+            return c.json({ character, ...loraSurface(character) }, 201);
+        }
+        // Generic URL (direct PNG or JSON link)
+        character = await fetchGenericCharacter(url, userId, libraryScope || "mine");
+        return c.json({ character, ...loraSurface(character) }, 201);
+    }
+    catch (err) {
+        if (isInvalidLibraryScopeError(err))
+            return respondInvalidLibraryScope(c);
+        if (err instanceof SSRFError) {
+            return c.json({ error: err.message }, 400);
+        }
+        return c.json({ error: err.message || "Failed to import from URL" }, 400);
+    }
+});
+// Replace only the portable card data on an existing character. This is kept
+// separate from /import so a JSON/PNG upload cannot accidentally create a new
+// character or replace its name/avatar.
+app.post("/:id/replace-card", async (c) => {
+    const userId = c.get("userId");
+    const characterId = c.req.param("id");
+    const existing = svc.getCharacter(userId, characterId);
+    if (!existing)
+        return c.json({ error: "Not found" }, 404);
+    try {
+        const formData = await c.req.formData();
+        const file = formData.get("file");
+        if (!(file instanceof File) || file.size === 0) {
+            return c.json({ error: "Character card file is required" }, 400);
+        }
+        const format = await cardSvc.detectCharacterImportFormat(file);
+        let cardInput;
+        if (format === "png") {
+            cardInput = await cardSvc.extractCardFromPng(file);
+        }
+        else if (format === "json") {
+            let json;
+            try {
+                json = JSON.parse(await file.text());
+            }
+            catch {
+                return c.json({ error: "Invalid JSON in uploaded file" }, 400);
+            }
+            cardInput = cardSvc.parseCardJson(json);
+        }
+        else {
+            return c.json({ error: "Only JSON and PNG character cards can replace card data" }, 400);
+        }
+        const updated = svc.updateCharacter(userId, characterId, buildCardReplacementInput(existing, cardInput));
+        // The character was checked above, but preserve the normal 404 contract
+        // should it be deleted between parsing and the update.
+        if (!updated)
+            return c.json({ error: "Not found" }, 404);
+        return c.json(updated);
+    }
+    catch (err) {
+        return respondImportError(c, err, "Failed to replace character card data");
+    }
+});
+app.get("/:id", (c) => {
+    const userId = c.get("userId");
+    const char = svc.getCharacter(userId, c.req.param("id"));
+    if (!char)
+        return c.json({ error: "Not found" }, 404);
+    return c.json(char);
+});
+app.get("/:id/homepage-preview", (c) => {
+    const preview = svc.getCharacterPreview(c.get("userId"), c.req.param("id"));
+    if (!preview)
+        return c.json({ error: "Not found" }, 404);
+    return c.json(preview);
+});
+app.put("/:id", async (c) => {
+    const userId = c.get("userId");
+    const body = await c.req.json();
+    try {
+        const char = svc.updateCharacter(userId, c.req.param("id"), body);
+        if (!char)
+            return c.json({ error: "Not found" }, 404);
+        return c.json(char);
+    }
+    catch (err) {
+        if (isInvalidLibraryScopeError(err))
+            return respondInvalidLibraryScope(c);
+        throw err;
+    }
+});
+app.delete("/:id", (c) => {
+    const userId = c.get("userId");
+    const deleted = svc.deleteCharacter(userId, c.req.param("id"));
+    if (!deleted)
+        return c.json({ error: "Not found" }, 404);
+    return c.json({ success: true });
+});
+app.get("/:id/avatar", async (c) => {
+    const userId = c.get("userId");
+    const info = svc.getCharacterAvatarInfo(userId, c.req.param("id"));
+    if (!info)
+        return c.json({ error: "Not found" }, 404);
+    const sizeParam = c.req.query("size");
+    const tier = sizeParam === "sm" || sizeParam === "lg" ? sizeParam : undefined;
+    // Prefer image_id, fall back to legacy avatar_path
+    for (const imageId of [info.avatar_crop_image_id, info.image_id]) {
+        if (!imageId)
+            continue;
+        const filepath = await images.getImageFilePath(userId, imageId, tier);
+        if (filepath) {
+            return createAvatarResolverResponse(filepath, imageId + (tier ? `_${tier}` : ""), c.req.header("If-None-Match"));
+        }
+    }
+    if (info.avatar_path) {
+        const filepath = await files.getAvatarPath(info.avatar_path);
+        if (filepath) {
+            return createAvatarResolverResponse(filepath, info.avatar_path, c.req.header("If-None-Match"));
+        }
+    }
+    return c.json({ error: "Not found" }, 404);
+});
+app.post("/:id/duplicate", (c) => {
+    const userId = c.get("userId");
+    const character = svc.duplicateCharacter(userId, c.req.param("id"));
+    if (!character)
+        return c.json({ error: "Not found" }, 404);
+    return c.json(character, 201);
+});
+app.get("/:id/image-gen-lora", (c) => {
+    const userId = c.get("userId");
+    const characterId = c.req.param("id");
+    if (!svc.getCharacter(userId, characterId)) {
+        return c.json({ error: "Not found" }, 404);
+    }
+    return c.json({ binding: characterLoraSvc.getCharacterLora(userId, characterId) });
+});
+app.put("/:id/image-gen-lora", async (c) => {
+    const userId = c.get("userId");
+    const characterId = c.req.param("id");
+    const body = await c.req.json().catch(() => null);
+    if (!body || typeof body !== "object") {
+        return c.json({ error: "Body must be a JSON object" }, 400);
+    }
+    if (typeof body.lora_name !== "string" || !body.lora_name.trim()) {
+        return c.json({ error: "lora_name is required" }, 400);
+    }
+    try {
+        const binding = characterLoraSvc.setCharacterLora(userId, characterId, {
+            lora_name: body.lora_name,
+            weight_model: body.weight_model,
+            weight_clip: body.weight_clip,
+            base_tags: typeof body.base_tags === "string" ? body.base_tags : undefined,
+            source_url: typeof body.source_url === "string" ? body.source_url : undefined,
+        });
+        return c.json({ binding });
+    }
+    catch (err) {
+        if (err?.message === "Character not found")
+            return c.json({ error: err.message }, 404);
+        return c.json({ error: err?.message || "Invalid binding" }, 400);
+    }
+});
+app.delete("/:id/image-gen-lora", (c) => {
+    const userId = c.get("userId");
+    const characterId = c.req.param("id");
+    if (!svc.getCharacter(userId, characterId)) {
+        return c.json({ error: "Not found" }, 404);
+    }
+    characterLoraSvc.deleteCharacterLora(userId, characterId);
+    return c.json({ success: true });
+});
+app.get("/:id/export", async (c) => {
+    const userId = c.get("userId");
+    const id = c.req.param("id");
+    const format = (c.req.query("format") || "json");
+    if (format === "json") {
+        const result = exportSvc.exportAsJson(userId, id);
+        if (!result)
+            return c.json({ error: "Not found" }, 404);
+        const name = exportSvc.sanitizeFilename(result.data?.name || "character");
+        return c.json(result, 200, {
+            "Content-Disposition": `attachment; filename="${name}.json"`,
+        });
+    }
+    if (format === "png") {
+        const buf = await exportSvc.exportAsPng(userId, id);
+        if (!buf)
+            return c.json({ error: "Not found" }, 404);
+        const character = svc.getCharacter(userId, id);
+        const name = exportSvc.sanitizeFilename(character?.name || "character");
+        return new Response(new Uint8Array(buf), {
+            headers: {
+                "Content-Type": "image/png",
+                "Content-Disposition": `attachment; filename="${name}.png"`,
+            },
+        });
+    }
+    if (format === "charx") {
+        const requestedExportId = c.req.query("export_id");
+        const exportId = requestedExportId && requestedExportId.length <= 128 ? requestedExportId : undefined;
+        const emitProgress = (payload) => {
+            try {
+                eventBus.emit(EventType.CHARACTER_EXPORT_PROGRESS, { characterId: id, exportId, ...payload }, userId);
+            }
+            catch {
+                // A download must not fail because the caller has no live WebSocket.
+            }
+        };
+        emitProgress({ phase: "preparing" });
+        try {
+            const buf = await exportSvc.exportAsCharx(userId, id, {
+                onProgress(progress) {
+                    // A card can contain hundreds of gallery images. Send enough updates
+                    // to feel live without flooding every connected client.
+                    if (progress.phase === "collecting_assets" &&
+                        progress.completed !== 0 &&
+                        progress.completed !== progress.total &&
+                        progress.completed % 4 !== 0) {
+                        return;
+                    }
+                    emitProgress(progress);
+                },
+            });
+            if (!buf) {
+                emitProgress({ phase: "failed", error: "Character not found" });
+                return c.json({ error: "Not found" }, 404);
+            }
+            const character = svc.getCharacter(userId, id);
+            const name = exportSvc.sanitizeFilename(character?.name || "character");
+            return new Response(new Uint8Array(buf), {
+                headers: {
+                    "Content-Type": "application/zip",
+                    "Content-Disposition": `attachment; filename="${name}.charx"`,
+                    "Content-Length": String(buf.byteLength),
+                    "Cache-Control": "no-store",
+                },
+            });
+        }
+        catch (err) {
+            emitProgress({ phase: "failed", error: err?.message || "Failed to export CHARX" });
+            throw err;
+        }
+    }
+    return c.json({ error: "Invalid format. Must be one of: json, png, charx" }, 400);
+});
+app.post("/:id/avatar", async (c) => {
+    const userId = c.get("userId");
+    const char = svc.getCharacter(userId, c.req.param("id"));
+    if (!char)
+        return c.json({ error: "Not found" }, 404);
+    const formData = await c.req.formData();
+    const file = formData.get("avatar");
+    const originalFile = formData.get("original_avatar");
+    if (!file)
+        return c.json({ error: "avatar file is required" }, 400);
+    const updated = await svc.replaceCharacterAvatar(userId, char.id, file, originalFile ?? undefined);
+    if (!updated)
+        return c.json({ error: "Not found" }, 404);
+    return c.json(updated);
+});
+app.post("/:id/perspective-layers", async (c) => {
+    const userId = c.get("userId");
+    const characterId = c.req.param("id");
+    if (!svc.getCharacter(userId, characterId))
+        return c.json({ error: "Not found" }, 404);
+    const formData = await c.req.formData();
+    const file = formData.get("image");
+    if (!file)
+        return c.json({ error: "image file is required" }, 400);
+    if (typeof file.type === "string" && file.type && !file.type.startsWith("image/")) {
+        return c.json({ error: "image file is required" }, 400);
+    }
+    const label = formData.get("label");
+    const intensityRaw = formData.get("intensity");
+    const intensity = typeof intensityRaw === "string" ? Number(intensityRaw) : undefined;
+    try {
+        const updated = await svc.addCharacterPerspectiveLayer(userId, characterId, file, {
+            label: typeof label === "string" ? label : undefined,
+            intensity,
+        });
+        if (!updated)
+            return c.json({ error: "Not found" }, 404);
+        return c.json(updated, 201);
+    }
+    catch (err) {
+        return c.json({ error: err?.message || "Invalid image" }, 400);
+    }
+});
+app.put("/:id/perspective-layers", async (c) => {
+    const userId = c.get("userId");
+    const characterId = c.req.param("id");
+    const body = await c.req.json().catch(() => null);
+    if (!body || typeof body !== "object" || !Array.isArray(body.layers)) {
+        return c.json({ error: "layers array is required" }, 400);
+    }
+    const updated = svc.updateCharacterPerspectiveLayers(userId, characterId, body.layers);
+    if (!updated)
+        return c.json({ error: "Not found" }, 404);
+    return c.json(updated);
+});
+app.post("/:id/perspective-layers/:layer", async (c) => {
+    const userId = c.get("userId");
+    const characterId = c.req.param("id");
+    const layer = c.req.param("layer");
+    if (!PERSPECTIVE_LAYERS.has(layer))
+        return c.json({ error: "Invalid layer" }, 400);
+    if (!svc.getCharacter(userId, characterId))
+        return c.json({ error: "Not found" }, 404);
+    const formData = await c.req.formData();
+    const file = formData.get("image");
+    if (!file)
+        return c.json({ error: "image file is required" }, 400);
+    if (typeof file.type === "string" && file.type && !file.type.startsWith("image/")) {
+        return c.json({ error: "image file is required" }, 400);
+    }
+    try {
+        const updated = await svc.setCharacterPerspectiveLayer(userId, characterId, layer, file);
+        if (!updated)
+            return c.json({ error: "Not found" }, 404);
+        return c.json(updated);
+    }
+    catch (err) {
+        return c.json({ error: err?.message || "Invalid image" }, 400);
+    }
+});
+app.delete("/:id/perspective-layers/:layer", (c) => {
+    const userId = c.get("userId");
+    const characterId = c.req.param("id");
+    const layer = c.req.param("layer");
+    const updated = PERSPECTIVE_LAYERS.has(layer)
+        ? svc.clearCharacterPerspectiveLayer(userId, characterId, layer)
+        : svc.deleteCharacterPerspectiveLayer(userId, characterId, layer);
+    if (!updated)
+        return c.json({ error: "Not found" }, 404);
+    return c.json(updated);
+});
+app.post("/import-bulk", async (c) => {
+    const userId = c.get("userId");
+    try {
+        const formData = await c.req.formData();
+        const files = formData.getAll("files");
+        if (!files.length)
+            return c.json({ error: "files are required" }, 400);
+        if (files.length > 500)
+            return c.json({ error: "Maximum 500 files per bulk import" }, 400);
+        const skipDuplicates = formData.get("skip_duplicates") === "true";
+        const results = [];
+        for (const file of files) {
+            const filename = file.name || "unknown";
+            try {
+                let cardInput;
+                let pngAvatar = null;
+                let charxResult = null;
+                const detectedFormat = await cardSvc.detectCharacterImportFormat(file);
+                if (detectedFormat === "png") {
+                    cardInput = await cardSvc.extractCardFromPng(file);
+                    pngAvatar = file;
+                }
+                else if (detectedFormat === "charx" || detectedFormat === "jpeg_polyglot") {
+                    charxResult = await cardSvc.extractCardFromCharx(file);
+                    cardInput = charxResult.card;
+                }
+                else if (detectedFormat === "jpeg") {
+                    // Plain JPEG with no embedded data — skip
+                    results.push({ filename, success: false, error: "JPEG file does not contain embedded character card data" });
+                    continue;
+                }
+                else {
+                    const text = await file.text();
+                    const json = JSON.parse(text);
+                    cardInput = cardSvc.parseCardJson(json);
+                }
+                // Deduplication check
+                if (skipDuplicates) {
+                    const hasRealFilename = filename && filename !== "unknown" && filename !== "";
+                    const existingByFile = hasRealFilename
+                        ? svc.findCharacterBySourceFilename(userId, filename)
+                        : null;
+                    if (existingByFile) {
+                        results.push({ filename, success: true, skipped: true, character: existingByFile });
+                        continue;
+                    }
+                    // No filename match — fall back to name-based check only when filename is absent
+                    if (!hasRealFilename && svc.characterExistsByName(userId, cardInput.name)) {
+                        const existing = svc.findCharactersByName(userId, cardInput.name);
+                        results.push({ filename, success: true, skipped: true, character: existing[0] });
+                        continue;
+                    }
+                }
+                const character = svc.createCharacter(userId, cardInput);
+                // Store source filename so re-imports can deduplicate by file identity
+                if (filename && filename !== "unknown" && filename !== "") {
+                    svc.setCharacterSourceFilename(userId, character.id, filename);
+                }
+                if (charxResult) {
+                    // Full CHARX processing (lumiverse_modules, gallery, inline assets,
+                    // RisuAI module/expressions) shared with single & URL import so the
+                    // bulk path keeps parity with the exporter.
+                    await applyCharxModulesAndAssets(userId, character, charxResult);
+                }
+                else {
+                    if (pngAvatar) {
+                        const image = await images.uploadImage(userId, pngAvatar);
+                        svc.setCharacterImage(userId, character.id, image.id);
+                        svc.setCharacterAvatar(userId, character.id, image.filename);
+                    }
+                    importCardRegexBestEffort(userId, character.id, cardInput.extensions);
+                    autoImportEmbeddedWorldbook(userId, character.id);
+                }
+                const imported = svc.getCharacter(userId, character.id);
+                // Check for embedded lorebook
+                let lorebook;
+                const charBook = imported.extensions?.character_book;
+                const entryCount = wbSvc.countImportedWorldBookEntries(charBook?.entries);
+                if (entryCount > 0) {
+                    lorebook = {
+                        name: charBook.name || `${imported.name}'s Lorebook`,
+                        entryCount,
+                    };
+                }
+                results.push({ filename, success: true, character: imported, lorebook, ...loraSurface(imported) });
+            }
+            catch (err) {
+                results.push({
+                    filename,
+                    success: false,
+                    error: err.message || "Failed to import",
+                });
+            }
+        }
+        const imported = results.filter((r) => r.success && !r.skipped && r.character).length;
+        const skipped = results.filter((r) => r.skipped).length;
+        const failed = results.filter((r) => !r.success).length;
+        return c.json({ results, summary: { total: files.length, imported, skipped, failed } }, 201);
+    }
+    catch (err) {
+        return respondImportError(c, err, "Bulk import failed");
+    }
+});
+app.post("/import-tag-library", async (c) => {
+    const userId = c.get("userId");
+    const formData = await c.req.formData();
+    const file = formData.get("file");
+    if (!(file instanceof File) || file.size === 0) {
+        return c.json({ error: "TagLibrary backup file is required" }, 400);
+    }
+    try {
+        const result = await tagLibrarySvc.importTagLibraryBackup(userId, file);
+        return c.json(result);
+    }
+    catch (err) {
+        return c.json({ error: err?.message || "Failed to import TagLibrary backup" }, 400);
+    }
+});
+app.post("/import", async (c) => {
+    const userId = c.get("userId");
+    const contentType = c.req.header("content-type") || "";
+    try {
+        if (contentType.includes("multipart/form-data")) {
+            const formData = await c.req.formData();
+            const file = formData.get("file");
+            if (!file)
+                return c.json({ error: "file is required" }, 400);
+            const rawScope = formData.get("library_scope");
+            const libraryScope = rawScope === null ? undefined : parseLibraryScope(rawScope);
+            if (rawScope !== null && !libraryScope)
+                return c.json({ error: "library_scope must be either 'mine' or 'shared'" }, 400);
+            const detectedFormat = await cardSvc.detectCharacterImportFormat(file);
+            if (detectedFormat === "png") {
+                // PNG card — extract embedded JSON + use as avatar
+                const cardInput = await cardSvc.extractCardFromPng(file);
+                const character = svc.createCharacter(userId, { ...cardInput, ...(libraryScope ? { library_scope: libraryScope } : {}) });
+                const image = await images.uploadImage(userId, file);
+                svc.setCharacterImage(userId, character.id, image.id);
+                svc.setCharacterAvatar(userId, character.id, image.filename);
+                importCardRegexBestEffort(userId, character.id, cardInput.extensions);
+                autoImportEmbeddedWorldbook(userId, character.id);
+                const imported = svc.getCharacter(userId, character.id);
+                return c.json({ character: imported, ...loraSurface(imported) }, 201);
+            }
+            else if (detectedFormat === "charx" || detectedFormat === "jpeg_polyglot") {
+                // CHARX archive (or JPEG+ZIP polyglot) — ZIP with card.json + optional
+                // avatar + gallery images + lumiverse_modules. The full processing is
+                // shared with bulk & URL import so all paths stay in parity (see
+                // applyCharxModulesAndAssets).
+                const charxResult = await cardSvc.extractCardFromCharx(file);
+                const character = svc.createCharacter(userId, { ...charxResult.card, ...(libraryScope ? { library_scope: libraryScope } : {}) });
+                const { lumiverseModulesSummary } = await applyCharxModulesAndAssets(userId, character, charxResult, {
+                    signal: c.req.raw.signal,
+                    emitGalleryProgress: true,
+                });
+                const imported = svc.getCharacter(userId, character.id);
+                return c.json({
+                    character: imported,
+                    ...(lumiverseModulesSummary ? { lumiverse_modules: lumiverseModulesSummary } : {}),
+                    ...loraSurface(imported),
+                }, 201);
+            }
+            else if (detectedFormat === "jpeg") {
+                return c.json({ error: "JPEG file does not contain embedded character card data" }, 400);
+            }
+            else {
+                // JSON file — read text content, parse card spec
+                const text = await file.text();
+                let json;
+                try {
+                    json = JSON.parse(text);
+                }
+                catch {
+                    return c.json({ error: "Invalid JSON in uploaded file" }, 400);
+                }
+                const cardInput = cardSvc.parseCardJson(json);
+                const character = svc.createCharacter(userId, { ...cardInput, ...(libraryScope ? { library_scope: libraryScope } : {}) });
+                importCardRegexBestEffort(userId, character.id, cardInput.extensions);
+                autoImportEmbeddedWorldbook(userId, character.id);
+                const imported = svc.getCharacter(userId, character.id);
+                return c.json({ character: imported, ...loraSurface(imported) }, 201);
+            }
+        }
+        else {
+            // Raw JSON body — support both card-spec wrapper and flat input
+            const body = await c.req.json();
+            const rawScope = body?.library_scope;
+            const libraryScope = rawScope === undefined ? undefined : parseLibraryScope(rawScope);
+            if (rawScope !== undefined && !libraryScope)
+                return c.json({ error: "library_scope must be either 'mine' or 'shared'" }, 400);
+            const input = (body.spec && body.data) ? cardSvc.parseCardJson(body) : body;
+            if (!input.name)
+                return c.json({ error: "name is required" }, 400);
+            const character = svc.createCharacter(userId, { ...input, ...(libraryScope ? { library_scope: libraryScope } : {}) });
+            importCardRegexBestEffort(userId, character.id, input.extensions);
+            autoImportEmbeddedWorldbook(userId, character.id);
+            const imported = svc.getCharacter(userId, character.id);
+            return c.json({ character: imported, ...loraSurface(imported) }, 201);
+        }
+    }
+    catch (err) {
+        return respondImportError(c, err, "Failed to import character card");
+    }
+});
+export { app as charactersRoutes };

@@ -581,6 +581,12 @@ export interface QuickToolbarSettings {
   showNativeScrollToTop?: boolean
   /** Native ChatView List (Browse messages). Default on (`!== false`). */
   showNativeBrowseMessages?: boolean
+  /** Native chat-top-dock controls placement when the Suite toolbar is absent. */
+  nativeDockActionSide?: 'left' | 'right'
+  /** Edit-and-send action placement in the message editor. */
+  editAndSendSide?: 'left' | 'right'
+  /** Whether edit-and-send should create a new chat branch. */
+  branchChatOnEditAndSend?: boolean
   /** Paint a solid backdrop behind the toolbar when enabled. */
   opaqueToolbarBackdrop?: boolean
   /** Optional solid backdrop color for the opaque toolbar plate. */

@@ -11,6 +11,7 @@ export interface EditAndSendInput {
   content: string
   expectedVersion: number
   requestId: string
+  branchChat?: boolean
 }
 
 export interface EditAndSendResult {

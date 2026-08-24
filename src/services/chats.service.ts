@@ -3350,6 +3350,7 @@ export interface EditAndSendInput {
   content: string;
   expectedVersion: number;
   requestId: string;
+  branchChat?: boolean;
 }
 
 export interface EditAndSendGenerationCursor {
@@ -3476,7 +3477,17 @@ export function editAndSend(
     const branchAt = subsequentAssistant ?? source;
     const mode: EditAndSendMode = subsequentAssistant ? "swipe" : "normal";
 
-    created = createChatBranchRows(userId, chat, branchAt);
+    const shouldBranch = input.branchChat !== false;
+    created = shouldBranch
+      ? createChatBranchRows(userId, chat, branchAt)
+      : {
+        sourceChatId: chatId,
+        newChatId: chatId,
+        branchId: chatId,
+        atMessageId: branchAt.id,
+        atMessageIndex: branchAt.index_in_chat,
+        idMap: new Map([[source.id, source.id], ...(subsequentAssistant ? [[subsequentAssistant.id, subsequentAssistant.id] as [string, string]] : [])]),
+      };
     branchRef.current = created;
     const editedMessageId = created.idMap.get(source.id);
     if (!editedMessageId) return { status: "not_found", error: "Failed to copy edited message" };
