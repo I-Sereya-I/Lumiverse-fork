@@ -41,6 +41,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
+          # Shared with main's desktop-cache-keepwarm.yml, which keeps it alive.
+          shared-key: win-desktop
           workspaces: desktop/src-tauri -> target
 
       - name: Install desktop dependencies
