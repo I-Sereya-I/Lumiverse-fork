@@ -59,9 +59,20 @@ jobs:
       - name: Stage the server inside the desktop app
         run: bun run build:desktop-server --reuse-server --stage-only
 
+      # Bundled builds refuse to compile without an updater public key, and the
+      # fork has no upstream signing key. A throwaway pair satisfies the check;
+      # its private half is discarded, so in-app updates never install.
+      - name: Generate a throwaway updater key
+        working-directory: desktop
+        shell: bash
+        run: |
+          bun run tauri signer generate --ci -p "" -w "$RUNNER_TEMP/updater.key"
+          bun -e 'const k=(await Bun.file(process.env.RUNNER_TEMP+"/updater.key.pub").text()).trim(); await Bun.write("src-tauri/tauri.fork-updater.conf.json", JSON.stringify({plugins:{updater:{pubkey:k}}}))'
+          rm -f "$RUNNER_TEMP/updater.key"
+
       - name: Build self-contained NSIS installer
         working-directory: desktop
-        run: bun run tauri build --config src-tauri/tauri.server-bundle.conf.json --bundles nsis --ci -- --locked
+        run: bun run tauri build --config src-tauri/tauri.server-bundle.conf.json --config src-tauri/tauri.fork-updater.conf.json --bundles nsis --ci -- --locked
 
       - uses: actions/upload-artifact@v7
         with:
