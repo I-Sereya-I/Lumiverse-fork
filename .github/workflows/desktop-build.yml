@@ -10,6 +10,10 @@ on:
     paths:
       - ".github/workflows/desktop-build.yml"
   workflow_dispatch:
+    inputs:
+      ref:
+        description: Upstream prolix-oc/Lumiverse branch, tag, or SHA to build
+        default: staging
 
 permissions:
   contents: read
@@ -32,7 +36,12 @@ jobs:
     name: Desktop (x86_64-pc-windows-msvc)
     runs-on: windows-2022
     steps:
+      # Build upstream source directly so every run gets the latest staging
+      # without syncing or rebasing this branch.
       - uses: actions/checkout@v7
+        with:
+          repository: prolix-oc/Lumiverse
+          ref: ${{ inputs.ref || 'staging' }}
 
       - uses: oven-sh/setup-bun@v2
         with:
