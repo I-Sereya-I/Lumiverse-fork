@@ -1,9 +1,9 @@
 name: Keep Windows desktop cache warm
 
 # Scheduled workflows only run from the default branch, and caches saved here
-# are readable by every branch. This job builds the windows-desktop-build-fast
-# code with the same cache key as its build workflow, so the Rust cache is
-# touched before GitHub's 7-day eviction and refreshed when the key changes
+# are readable by every branch. This job builds upstream staging (the same
+# source windows-desktop-build-fast builds) with the same cache key as that
+# branch's build workflow, so the Rust cache is touched before GitHub's 7-day eviction and refreshed when the key changes
 # (new Cargo.lock or Rust toolchain). On an exact cache hit nothing is re-saved.
 on:
   schedule:
@@ -32,7 +32,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: windows-desktop-build-fast
+          repository: prolix-oc/Lumiverse
+          ref: staging
 
       - uses: oven-sh/setup-bun@v2
         with:
