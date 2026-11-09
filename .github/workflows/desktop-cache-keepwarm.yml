@@ -1,0 +1,54 @@
+name: Keep Windows desktop cache warm
+
+# Scheduled workflows only run from the default branch, and caches saved here
+# are readable by every branch. This job builds the windows-desktop-build-fast
+# code with the same cache key as its build workflow, so the Rust cache is
+# touched before GitHub's 7-day eviction and refreshed when the key changes
+# (new Cargo.lock or Rust toolchain). On an exact cache hit nothing is re-saved.
+on:
+  schedule:
+    - cron: "23 5 */3 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-cache-keepwarm
+  cancel-in-progress: false
+
+# Must match windows-desktop-build-fast's desktop-build.yml exactly; CARGO_*
+# variables are part of the rust-cache key.
+env:
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  warm:
+    name: Warm Windows desktop cache
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: windows-desktop-build-fast
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: win-desktop
+          workspaces: desktop/src-tauri -> target
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: bun install --frozen-lockfile
+
+      - name: Compile without bundling
+        working-directory: desktop
+        run: bun run tauri build --no-bundle --ci -- --locked
