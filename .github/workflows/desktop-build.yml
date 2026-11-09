@@ -62,12 +62,14 @@ jobs:
       # Bundled builds refuse to compile without an updater public key, and the
       # fork has no upstream signing key. A throwaway pair satisfies the check;
       # its private half is discarded, so in-app updates never install.
-      - name: Generate a throwaway updater key
+      # The same override packs the installer with zlib instead of the default
+      # LZMA: a larger .exe, but minutes faster to compress.
+      - name: Generate fork build overrides
         working-directory: desktop
         shell: bash
         run: |
           bun run tauri signer generate --ci -p "" -w "$RUNNER_TEMP/updater.key"
-          bun -e 'const k=(await Bun.file(process.env.RUNNER_TEMP+"/updater.key.pub").text()).trim(); await Bun.write("src-tauri/tauri.fork-updater.conf.json", JSON.stringify({plugins:{updater:{pubkey:k}}}))'
+          bun -e 'const k=(await Bun.file(process.env.RUNNER_TEMP+"/updater.key.pub").text()).trim(); await Bun.write("src-tauri/tauri.fork-updater.conf.json", JSON.stringify({plugins:{updater:{pubkey:k}},bundle:{windows:{nsis:{compression:"zlib"}}}}))'
           rm -f "$RUNNER_TEMP/updater.key"
 
       - name: Build self-contained NSIS installer
