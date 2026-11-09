@@ -1,7 +1,8 @@
 name: Build Desktop
 
-# Windows x64-only, speed-focused desktop build. Produces the NSIS installer as
-# a workflow artifact. Tests, validation, and non-Windows targets are omitted;
+# Windows x64-only, speed-focused desktop build. Produces a self-contained NSIS
+# installer (desktop app + built-in Lumiverse server) as a workflow artifact.
+# Unsigned for updates: no updater key exists on this fork. Tests, validation, and non-Windows targets are omitted;
 # run upstream's full desktop-build.yml for those.
 on:
   push:
@@ -45,13 +46,22 @@ jobs:
           shared-key: win-desktop
           workspaces: desktop/src-tauri -> target
 
-      - name: Install desktop dependencies
-        working-directory: desktop
-        run: bun install --frozen-lockfile
+      - name: Install dependencies
+        shell: bash
+        run: |
+          bun install --frozen-lockfile
+          (cd frontend && bun install --frozen-lockfile)
+          (cd desktop && bun install --frozen-lockfile)
 
-      - name: Build NSIS installer
+      - name: Build the standalone Lumiverse server
+        run: bun run build:server
+
+      - name: Stage the server inside the desktop app
+        run: bun run build:desktop-server --reuse-server --stage-only
+
+      - name: Build self-contained NSIS installer
         working-directory: desktop
-        run: bun run tauri build --bundles nsis --ci -- --locked
+        run: bun run tauri build --config src-tauri/tauri.server-bundle.conf.json --bundles nsis --ci -- --locked
 
       - uses: actions/upload-artifact@v7
         with:
